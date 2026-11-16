@@ -135,9 +135,10 @@ local function track(c)
 	return c
 end
 
+local UAMX = {} -- unanchored-manipulation hooks (filled in below)
 -- forward declarations (assigned further down)
 local setFly, stopAttach, beginAttach, clearMove, stopMimic, stopPose, playPose, clearPose
-local setUpside, sendChat, startDance, stopAll, protectAuth
+local setUpside, sendChat, startDance, stopAll, protectAuth, setDeaf, enforceDeaf
 
 ----------------------------------------------------------------------
 -- Helpers
@@ -1918,14 +1919,86 @@ local function startStarPlatinum(who)
 end
 
 ----------------------------------------------------------------------
+-- .blind (black screen) and .deaf (can't see chat) - both only affect my own screen
+----------------------------------------------------------------------
+local blindGui = nil
+local function setBlind(on)
+	if on then
+		if blindGui then return end
+		blindGui = Instance.new("ScreenGui")
+		blindGui.Name = "ServantBlind_" .. tostring(math.random(100000, 999999))
+		blindGui.ResetOnSpawn = false
+		blindGui.IgnoreGuiInset = true
+		blindGui.DisplayOrder = 2147483000
+		local f = Instance.new("Frame")
+		f.Size = UDim2.fromScale(1, 1)
+		f.BackgroundColor3 = Color3.new(0, 0, 0)
+		f.BorderSizePixel = 0
+		f.Parent = blindGui
+		safeParent(blindGui)
+	elseif blindGui then
+		pcall(function() blindGui:Destroy() end)
+		blindGui = nil
+	end
+end
+
+local deafPrev = nil
+enforceDeaf = function()
+	pcall(function()
+		local cw = TextChatService:FindFirstChildOfClass("ChatWindowConfiguration")
+		if cw then
+			if deafPrev and deafPrev.window == nil then deafPrev.window = cw.Enabled end
+			if cw.Enabled then cw.Enabled = false end
+		end
+	end)
+	pcall(function()
+		local bc = TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+		if bc then
+			if deafPrev and deafPrev.bubble == nil then deafPrev.bubble = bc.Enabled end
+			if bc.Enabled then bc.Enabled = false end
+		end
+	end)
+	pcall(function()
+		if deafPrev and deafPrev.core == nil then deafPrev.core = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Chat) end
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, false)
+	end)
+end
+
+setDeaf = function(on)
+	if on then
+		if S.deaf then return end
+		S.deaf = true
+		deafPrev = {}
+		enforceDeaf()
+	elseif S.deaf then
+		S.deaf = false
+		local prev = deafPrev or {}
+		deafPrev = nil
+		pcall(function()
+			local cw = TextChatService:FindFirstChildOfClass("ChatWindowConfiguration")
+			if cw and prev.window ~= nil then cw.Enabled = prev.window end
+		end)
+		pcall(function()
+			local bc = TextChatService:FindFirstChildOfClass("BubbleChatConfiguration")
+			if bc and prev.bubble ~= nil then bc.Enabled = prev.bubble end
+		end)
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, prev.core ~= false)
+		end)
+	end
+end
+
+----------------------------------------------------------------------
 -- .cmds and .help
 ----------------------------------------------------------------------
 -- Chat lines never start with "." so other servant scripts don't mistake them for commands
 local CMD_LINES = {
-	"Commands (1/4): .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
-	"Commands (2/4): .fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
-	"Commands (3/4): .leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
-	"Commands (4/4): .mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal | .help <cmd> explains one",
+	"Commands (1/6): .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
+	"Commands (2/6): .fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
+	"Commands (3/6): .leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
+	"Commands (4/6): .mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal",
+	"Commands (5/6): .reset .leave .rejoin .blind .unblind .deaf .undeaf | .help <cmd> explains one",
+	"Commands (6/6): say Activate unanchored manipulation mode to unlock !orbit !wall !stairs !release !clear (I tap parts to select them)",
 }
 local function showCommands()
 	for _, line in ipairs(CMD_LINES) do sendChat(line) end
@@ -1970,6 +2043,17 @@ local HELP = {
 	kiss = ".kiss - I give you a short, sweet kiss animation. Ends by itself; .normal cancels.",
 	owner = ".owner <player> - lets that player command me too; 'owner' targets then follow whoever said the command. Main owner only. Undo: .unowner",
 	ownertransfer = ".ownertransfer <player> - hands main ownership to that player and you lose control. Main owner only.",
+	reset = ".reset - I reset my character (respawn).",
+	leave = ".leave - I say goodbye and leave the game.",
+	rejoin = ".rejoin - I rejoin the game (same server if possible). The script reloads itself afterwards.",
+	blind = ".blind - my screen turns black. Undo: .unblind (or .normal)",
+	deaf = ".deaf - I can't see any chat messages. Undo: .undeaf (or .normal)",
+	activate = "Say 'Activate unanchored manipulation mode' to unlock !orbit !wall !stairs. I tap/drag across loose parts to pick them (max 60). Off: 'Deactivate unanchored manipulation mode'",
+	["!orbit"] = "!orbit - my selected parts orbit you (needs the mode on). Stop with !release (parts drop) or !clear (also unselects).",
+	["!wall"] = "!wall - my selected parts form a wall in front of you and follow you. Stop with !release or !clear.",
+	["!stairs"] = "!stairs - my selected parts become stairs where you stand (they stay there). !release lets go, !clear also unselects.",
+	["!release"] = "!release - I let go of the parts I'm controlling; they stay selected. !clear lets go and unselects everything.",
+	["!clear"] = "!clear - I let go of every part and unselect them all.",
 	normal = ".normal - stops everything and resets speed, jump power, mute and more.",
 	help = ".help [cmd] - explains how a command works, its variants and how to undo it.",
 }
@@ -1979,16 +2063,18 @@ local HELP_ALIAS = {
 	unsword = "sword", unvest = "vest", unleash = "leash", unstand = "stand",
 	nospeedboost = "speedboost", unorbit = "orbit", noupsidedown = "upsidedown",
 	unmimic = "mimic", unowner = "owner", unkneel = "kneel", commands = "cmds", jp = "jumppower",
-	ws = "speed",
+	ws = "speed", unblind = "blind", undeaf = "deaf",
 }
 local function showHelp(name)
-	name = trim(name):lower():gsub("^%" .. CONFIG.Prefix, "")
+	name = trim(name):lower()
+	local bang = name:sub(1, 1) == "!"
+	name = name:gsub("^[%.!]", "")
 	if name == "" then
 		showCommands()
 		return
 	end
-	name = HELP_ALIAS[name] or name
-	sendChat("Help: " .. (HELP[name] or ("I don't know a command called ." .. name .. " - try .cmds")))
+	if bang then name = "!" .. name else name = HELP_ALIAS[name] or name end
+	sendChat("Help: " .. (HELP[name] or ("I don't know a command called " .. name .. " - try .cmds")))
 end
 
 stopAll = function()
@@ -1999,6 +2085,9 @@ stopAll = function()
 	setMute(false)
 	setSecurity(false)
 	setLeash(false)
+	setBlind(false)
+	setDeaf(false)
+	if UAMX.off then UAMX.off() end
 	clearPose()
 	S.walkSpeed, S.jumpPower = nil, nil
 	S.limpUntil, S.noclipUntil = 0, 0
@@ -2094,6 +2183,280 @@ local function update(dt)
 
 	poseStep(dt)
 end
+
+;(function() -- own function scope: the main chunk is near Lua's 200-local limit
+----------------------------------------------------------------------
+-- Unanchored manipulation mode
+-- Only parts I tap/drag to select are used. No server-wide grabbing: a part can only be moved
+-- if the game already lets me simulate it (stay close to it). Never characters, tools,
+-- accessories or anchored parts.
+----------------------------------------------------------------------
+local UAM_MAX = 60
+local U = { active = false, sel = {}, idx = {}, count = 0, n = 0, mode = nil, target = nil,
+	rel = {}, base = nil, cc = {}, boxes = {}, ang = 0, tick = 0 }
+local uamFolder = nil
+local GREEN, ORANGE = Color3.fromRGB(80, 220, 120), Color3.fromRGB(255, 170, 40)
+
+local function uamOwned(root)
+	if isnetworkowner then
+		local ok, r = pcall(isnetworkowner, root)
+		if ok then return r end
+	end
+	return true
+end
+
+local function uamRootFromPart(part)
+	if not (part and part:IsA("BasePart")) or part:IsA("Terrain") then return nil end
+	local root = part.AssemblyRootPart or part
+	if root.Anchored then return nil end
+	local a = root
+	while a and a ~= Workspace do
+		if a:FindFirstChildOfClass("Humanoid") or a:IsA("Tool") or a:IsA("Accessory") then return nil end
+		a = a.Parent
+	end
+	local s = root.Size
+	if math.max(s.X, s.Y, s.Z) > 120 then return nil end
+	return root
+end
+
+local function uamBox(root)
+	if not uamFolder or not uamFolder.Parent then
+		uamFolder = Instance.new("Folder")
+		uamFolder.Name = "ServantSel"
+		uamFolder.Parent = Workspace.CurrentCamera
+	end
+	local b = Instance.new("SelectionBox")
+	b.Adornee = root
+	b.LineThickness = 0.06
+	b.Color3 = GREEN
+	b.SurfaceColor3 = GREEN
+	b.SurfaceTransparency = 0.8
+	b.Parent = uamFolder
+	return b
+end
+
+local function uamSelect(root)
+	if U.sel[root] then return end
+	if U.count >= UAM_MAX then
+		notify("Selection is full (" .. UAM_MAX .. " parts).")
+		return
+	end
+	U.n = U.n + 1
+	U.sel[root], U.idx[root] = true, U.n
+	U.count = U.count + 1
+	U.boxes[root] = uamBox(root)
+end
+
+local function uamRestore(root)
+	if U.cc[root] ~= nil and root.Parent then root.CanCollide = U.cc[root] end
+	U.cc[root] = nil
+	U.rel[root] = nil
+end
+
+local function uamDeselect(root)
+	if not U.sel[root] then return end
+	uamRestore(root)
+	if U.boxes[root] then pcall(function() U.boxes[root]:Destroy() end) end
+	U.boxes[root], U.sel[root], U.idx[root] = nil, nil, nil
+	U.count = U.count - 1
+end
+
+local function uamRelease()
+	U.mode, U.base = nil, nil
+	for root in pairs(U.sel) do uamRestore(root) end
+end
+
+local function uamClear()
+	uamRelease()
+	for root in pairs(U.sel) do uamDeselect(root) end
+end
+
+local function uamOff()
+	if not U.active and U.count == 0 then return end
+	uamClear()
+	U.active = false
+	if uamFolder then
+		pcall(function() uamFolder:Destroy() end)
+		uamFolder = nil
+	end
+end
+
+local function uamList()
+	local list = {}
+	for root in pairs(U.sel) do
+		if root.Parent then list[#list + 1] = root else uamDeselect(root) end
+	end
+	table.sort(list, function(a, b) return U.idx[a] < U.idx[b] end)
+	return list
+end
+
+local function uamPlace(root, cf)
+	if not uamOwned(root) then return end
+	root.CFrame = cf
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function uamStep(dt)
+	if not U.active then return end
+	U.tick = U.tick + dt
+	if U.tick > 0.5 then
+		U.tick = 0
+		for root, box in pairs(U.boxes) do
+			if not root.Parent then
+				uamDeselect(root)
+			else
+				local c = uamOwned(root) and GREEN or ORANGE
+				box.Color3, box.SurfaceColor3 = c, c
+			end
+		end
+	end
+	local mode = U.mode
+	if not mode then return end
+	local oh = hrpOf(U.target)
+	if not oh then return end
+	local list = uamList()
+	if mode == "orbit" then
+		U.ang = U.ang + dt * 1.6
+		local n = #list
+		local per = math.max(1, math.ceil(n / 3))
+		for i, root in ipairs(list) do
+			local ring = (i - 1) % 3
+			local k = math.floor((i - 1) / 3)
+			local a = U.ang * (ring % 2 == 0 and 1 or -1) + (k / per) * math.pi * 2 + ring
+			local r = 8 + ring * 3
+			local h = 1.5 + ring * 2.2 + math.sin(U.ang * 2 + i) * 0.8
+			uamPlace(root, CFrame.new(oh.Position + Vector3.new(math.cos(a) * r, h, math.sin(a) * r)) * CFrame.Angles(0, a, 0))
+		end
+	elseif mode == "wall" then
+		for _, root in ipairs(list) do
+			if U.rel[root] then uamPlace(root, oh.CFrame * U.rel[root]) end
+		end
+	elseif mode == "stairs" and U.base then
+		for _, root in ipairs(list) do
+			if U.rel[root] then uamPlace(root, U.base * U.rel[root]) end
+		end
+	end
+end
+
+local function uamLayout(list, ground, fn)
+	local cw, ch, cd = 2, 2, 2
+	for _, r in ipairs(list) do
+		cw, ch, cd = math.max(cw, r.Size.X), math.max(ch, r.Size.Y), math.max(cd, r.Size.Z)
+	end
+	cw, ch, cd = math.min(cw, 12), math.min(ch, 12), math.min(cd, 8)
+	for i, root in ipairs(list) do U.rel[root] = fn(i - 1, root, cw, ch, cd) end
+end
+
+local function uamCommand(name, who)
+	if name == "release" then
+		uamRelease()
+		return
+	end
+	if name == "clear" then
+		uamClear()
+		return
+	end
+	if U.count == 0 then
+		sendChat("I haven't selected any parts yet - I need to tap some first.")
+		return
+	end
+	uamRelease()
+	U.target = who.UserId
+	local oh, list = hrpOf(who.UserId), uamList()
+	if not oh then return end
+	local ochar = charOf(who.UserId)
+	local ohum = ochar and ochar:FindFirstChildOfClass("Humanoid")
+	local feet = -standHeight(ohum, oh)
+	if name == "orbit" then
+		U.mode = "orbit"
+		for _, root in ipairs(list) do
+			U.cc[root] = root.CanCollide
+			root.CanCollide = false
+		end
+	elseif name == "wall" then
+		local cols = math.max(1, math.ceil(math.sqrt(#list * 2)))
+		uamLayout(list, feet, function(i, root, cw, ch)
+			local col, row = i % cols, math.floor(i / cols)
+			return CFrame.new((col - (cols - 1) / 2) * cw, feet + row * ch + ch / 2, -9)
+		end)
+		U.mode = "wall"
+	elseif name == "stairs" then
+		local look = flat(oh.CFrame.LookVector)
+		local yaw = look.Magnitude > 0.01 and math.atan2(-look.X, -look.Z) or 0
+		U.base = CFrame.new(oh.Position) * CFrame.Angles(0, yaw, 0)
+		uamLayout(list, feet, function(i, root, cw, ch, cd)
+			local col, row = i % 3, math.floor(i / 3)
+			return CFrame.new((col - 1) * cw, feet + (row + 1) * 1.2 - root.Size.Y / 2, -(6 + row * cd))
+		end)
+		U.mode = "stairs"
+	end
+end
+
+local function uamParse(lower)
+	if lower:match("^activate unanchored manipulation mode[%.!]*$") then return "on" end
+	if lower:match("^deactivate unanchored manipulation mode[%.!]*$") then return "off" end
+	local b = lower:match("^!(%a+)")
+	if b == "orbit" or b == "wall" or b == "stairs" or b == "release" or b == "clear" then return b end
+	return nil
+end
+
+local function uamHandle(c, who)
+	if c == "on" then
+		U.active = true
+		sendChat("Unanchored manipulation mode is on. I'll tap the parts to use, then you say !orbit, !wall or !stairs.")
+		notify("Tap parts (or drag across them) to select. Green = I control it, orange = stay closer. Max " .. UAM_MAX .. ".")
+	elseif c == "off" then
+		uamOff()
+		sendChat("Unanchored manipulation mode is off.")
+	elseif not U.active then
+		sendChat("Say 'Activate unanchored manipulation mode' first.")
+	else
+		uamCommand(c, who)
+	end
+end
+
+-- tap/click a part to toggle it, or hold and drag across parts to add them
+local pressing, pressedRoot, pressedPos, dragMoved = false, nil, nil, false
+local function pointerRoot(pos)
+	local cam = Workspace.CurrentCamera
+	local ray = cam:ScreenPointToRay(pos.X, pos.Y)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { getChar() or cam, uamFolder or cam }
+	local hit = Workspace:Raycast(ray.Origin, ray.Direction * 2000, rp)
+	return hit and uamRootFromPart(hit.Instance) or nil
+end
+local function isPointer(t)
+	return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+track(UserInputService.InputBegan:Connect(function(input, processed)
+	if not U.active or processed or not isPointer(input.UserInputType) then return end
+	pressing, dragMoved, pressedPos = true, false, input.Position
+	pressedRoot = pointerRoot(input.Position)
+end))
+track(UserInputService.InputChanged:Connect(function(input)
+	if not (U.active and pressing) then return end
+	local t = input.UserInputType
+	if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
+	if (input.Position - pressedPos).Magnitude > 10 then
+		if not dragMoved and pressedRoot then uamSelect(pressedRoot) end
+		dragMoved = true
+		local root = pointerRoot(input.Position)
+		if root then uamSelect(root) end
+	end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+	if not pressing or not isPointer(input.UserInputType) then return end
+	pressing = false
+	if U.active and not dragMoved and pressedRoot then
+		if U.sel[pressedRoot] then uamDeselect(pressedRoot) else uamSelect(pressedRoot) end
+	end
+	pressedRoot = nil
+end))
+track(RunService.Stepped:Connect(function(_, dt) pcall(uamStep, dt) end))
+UAMX.off, UAMX.parse, UAMX.handle = uamOff, uamParse, uamHandle
+end)()
 
 ----------------------------------------------------------------------
 -- Owner system
@@ -2221,6 +2584,33 @@ end)
 reg({ "mimic" }, function(_, _, who) startMimic(who.UserId) end)
 reg({ "unmimic" }, function() stopMimic() end)
 
+-- reset / leave / rejoin / blind / deaf
+reg({ "reset" }, function()
+	local hum = getHum()
+	if hum then hum.Health = 0 end
+end)
+reg({ "leave" }, function()
+	sendChat("Goodbye!")
+	task.delay(3, function() LocalPlayer:Kick("Servant: my owner told me to leave.") end)
+end)
+reg({ "rejoin" }, function()
+	sendChat("Rejoining...")
+	task.delay(2.5, function()
+		local ts = game:GetService("TeleportService")
+		pcall(function()
+			if #Players:GetPlayers() <= 1 then
+				ts:Teleport(game.PlaceId, LocalPlayer)
+			else
+				ts:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+			end
+		end)
+	end)
+end)
+reg({ "blind" }, function() setBlind(true) end)
+reg({ "unblind" }, function() setBlind(false) end)
+reg({ "deaf" }, function() setDeaf(true) end)
+reg({ "undeaf" }, function() setDeaf(false) end)
+
 -- manual movement
 local function moveTimed(dirv, args)
 	if not ensureMove() then return end
@@ -2294,6 +2684,14 @@ local function onChat(plr, msg)
 	if not isAuth(plr.UserId) then return end
 	msg = trim(tostring(msg or ""))
 	local lower = msg:lower()
+	local uc = UAMX.parse and UAMX.parse(lower)
+	if uc then
+		local now, key = os.clock(), plr.UserId .. ":" .. msg
+		if key == lastKey and now - lastCmdT < 0.6 then return end
+		lastKey, lastCmdT = key, now
+		UAMX.handle(uc, plr)
+		return
+	end
 	local cmd, rest
 	if lower:match("^stop[%.!]*$") then
 		cmd, rest = "stop", ""
@@ -2386,6 +2784,7 @@ track(RunService.Heartbeat:Connect(function(dt)
 	if muteTimer > 0.5 then
 		muteTimer = 0
 		if S.muted then applyChatBlock(true) end
+		if S.deaf then enforceDeaf() end
 	end
 end))
 
