@@ -311,26 +311,71 @@ end
 ----------------------------------------------------------------------
 -- Chat: sending, and mute (chat input block + overlay)
 ----------------------------------------------------------------------
+local function findChatChannel()
+	local channels = TextChatService:FindFirstChild("TextChannels")
+	if not channels then return nil end
+	local cfg = TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+	if cfg and cfg.TargetTextChannel then return cfg.TargetTextChannel end
+	local general = channels:FindFirstChild("RBXGeneral")
+	if general then return general end
+	for _, c in ipairs(channels:GetChildren()) do
+		if c:IsA("TextChannel") and c.Name ~= "RBXSystem" then return c end
+	end
+	return nil
+end
+
+-- returns "ok", "flood", "blocked", "filtered" or "fail"
+local function rawSend(text)
+	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+		local channel = findChatChannel()
+		if channel then
+			local ok, msg = pcall(function() return channel:SendAsync(text) end)
+			if ok then
+				local st = msg and msg.Status
+				local name = st and st.Name or "Success"
+				if name == "Floodchecked" then return "flood" end
+				if name == "InvalidPrivacySettings" or name == "InvalidTextChannelPermissions" then return "blocked" end
+				if name == "TextFilterFailed" then return "filtered" end
+				if name == "Success" or name == "Sending" or name == "Unknown" then return "ok" end
+				return "fail"
+			end
+		end
+	end
+	local ev = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+	local say = ev and ev:FindFirstChild("SayMessageRequest")
+	if say then
+		say:FireServer(text, "All")
+		return "ok"
+	end
+	return "fail"
+end
+
+-- Every message goes through one paced queue so Roblox's flood check never swallows it.
+local chatQueue, chatWorker, lastChatT, chatWarned = {}, false, 0, false
 sendChat = function(text)
 	text = tostring(text):sub(1, 200)
-	local sent = false
-	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-		pcall(function()
-			local channels = TextChatService:FindFirstChild("TextChannels")
-			local general = channels and channels:FindFirstChild("RBXGeneral")
-			if general then
-				general:SendAsync(text)
-				sent = true
+	if #chatQueue >= 14 then return end
+	chatQueue[#chatQueue + 1] = { text = text, tries = 0 }
+	if chatWorker then return end
+	chatWorker = true
+	task.spawn(function()
+		while #chatQueue > 0 do
+			local item = table.remove(chatQueue, 1)
+			local gap = 1.3 - (os.clock() - lastChatT)
+			if gap > 0 then task.wait(gap) end
+			lastChatT = os.clock()
+			local r = rawSend(item.text)
+			if r == "flood" and item.tries < 3 then
+				item.tries = item.tries + 1
+				table.insert(chatQueue, 1, item)
+				task.wait(4)
+			elseif (r == "blocked" or r == "fail") and not chatWarned then
+				chatWarned = true
+				notify("Roblox or this game is blocking my chat messages, so other players can't see them. Check your account's chat settings.")
 			end
-		end)
-	end
-	if not sent then
-		pcall(function()
-			local ev = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
-			local say = ev and ev:FindFirstChild("SayMessageRequest")
-			if say then say:FireServer(text, "All") end
-		end)
-	end
+		end
+		chatWorker = false
+	end)
 end
 
 local blockGui = Instance.new("ScreenGui")
@@ -1799,19 +1844,15 @@ end
 ----------------------------------------------------------------------
 -- .cmds and .help
 ----------------------------------------------------------------------
+-- Chat lines never start with "." so other servant scripts don't mistake them for commands
 local CMD_LINES = {
-	"Commands: .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
-	".fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
-	".leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
-	".mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal .help <cmd>",
+	"Commands (1/4): .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
+	"Commands (2/4): .fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
+	"Commands (3/4): .leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
+	"Commands (4/4): .mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal | .help <cmd> explains one",
 }
 local function showCommands()
-	task.spawn(function()
-		for _, line in ipairs(CMD_LINES) do
-			sendChat(line)
-			task.wait(1.6)
-		end
-	end)
+	for _, line in ipairs(CMD_LINES) do sendChat(line) end
 end
 
 local HELP = {
@@ -1871,7 +1912,7 @@ local function showHelp(name)
 		return
 	end
 	name = HELP_ALIAS[name] or name
-	sendChat(HELP[name] or ("I don't know a command called ." .. name .. " - try .cmds"))
+	sendChat("Help: " .. (HELP[name] or ("I don't know a command called ." .. name .. " - try .cmds")))
 end
 
 stopAll = function()
