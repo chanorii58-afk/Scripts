@@ -311,47 +311,122 @@ end
 ----------------------------------------------------------------------
 -- Chat: sending, and mute (chat input block + overlay)
 ----------------------------------------------------------------------
-local function findChatChannel()
-	local channels = TextChatService:FindFirstChild("TextChannels")
-	if not channels then return nil end
-	local cfg = TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
-	if cfg and cfg.TargetTextChannel then return cfg.TargetTextChannel end
-	local general = channels:FindFirstChild("RBXGeneral")
-	if general then return general end
-	for _, c in ipairs(channels:GetChildren()) do
-		if c:IsA("TextChannel") and c.Name ~= "RBXSystem" then return c end
-	end
-	return nil
+local function banner(text, r, g, b, secs)
+	pcall(function()
+		local pg = LocalPlayer:FindFirstChild("PlayerGui")
+		if not pg then return end
+		local sg = Instance.new("ScreenGui")
+		sg.Name = "ServantBanner"
+		sg.ResetOnSpawn = false
+		sg.IgnoreGuiInset = true
+		sg.DisplayOrder = 2147483645
+		local l = Instance.new("TextLabel")
+		l.Position = UDim2.fromOffset(10, 60)
+		l.Size = UDim2.new(1, -20, 0, 0)
+		l.AutomaticSize = Enum.AutomaticSize.Y
+		l.BackgroundColor3 = Color3.fromRGB(r, g, b)
+		l.BackgroundTransparency = 0.1
+		l.TextColor3 = Color3.new(1, 1, 1)
+		l.TextWrapped = true
+		l.TextSize = 15
+		l.Font = Enum.Font.GothamBold
+		l.Text = text
+		l.Parent = sg
+		sg.Parent = pg
+		task.delay(secs, function() sg:Destroy() end)
+	end)
 end
 
--- returns "ok", "flood", "blocked", "filtered" or "fail"
-local function rawSend(text)
-	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
-		local channel = findChatChannel()
-		if channel then
-			local ok, msg = pcall(function() return channel:SendAsync(text) end)
-			if ok then
-				local st = msg and msg.Status
-				local name = st and st.Name or "Success"
-				if name == "Floodchecked" then return "flood" end
-				if name == "InvalidPrivacySettings" or name == "InvalidTextChannelPermissions" then return "blocked" end
-				if name == "TextFilterFailed" then return "filtered" end
-				if name == "Success" or name == "Sending" or name == "Unknown" then return "ok" end
-				return "fail"
+-- Chat = the real Roblox chat (everyone sees it). We also watch for our own message coming back
+-- through the chat so we know it was really delivered.
+local lastEcho = 0
+local hookedChannels = {}
+local function hookChannels()
+	pcall(function()
+		local channels = TextChatService:FindFirstChild("TextChannels")
+		if not channels then return end
+		for _, c in ipairs(channels:GetChildren()) do
+			if c:IsA("TextChannel") and not hookedChannels[c] then
+				hookedChannels[c] = true
+				track(c.MessageReceived:Connect(function(m)
+					local src = m.TextSource
+					if src and src.UserId == LocalPlayer.UserId then lastEcho = os.clock() end
+				end))
 			end
+		end
+	end)
+end
+track(LocalPlayer.Chatted:Connect(function() lastEcho = os.clock() end))
+
+local function chatChannels()
+	local list, seen = {}, {}
+	local function add(c)
+		if c and not seen[c] then
+			seen[c] = true
+			list[#list + 1] = c
+		end
+	end
+	local channels = TextChatService:FindFirstChild("TextChannels")
+	if channels then
+		add(channels:FindFirstChild("RBXGeneral"))
+		local cfg = TextChatService:FindFirstChildOfClass("ChatInputBarConfiguration")
+		if cfg then add(cfg.TargetTextChannel) end
+		for _, c in ipairs(channels:GetChildren()) do
+			if c:IsA("TextChannel") and c.Name ~= "RBXSystem" then add(c) end
+		end
+	end
+	return list
+end
+
+-- returns result ("ok" | "flood" | "blocked" | "filtered" | "fail") and a list of details
+local function rawSend(text)
+	local details = {}
+	local t0 = os.clock()
+	local function echoed(wait)
+		local t = os.clock()
+		while os.clock() - t < wait and lastEcho < t0 do task.wait(0.1) end
+		return lastEcho >= t0
+	end
+	hookChannels()
+	if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+		for _, ch in ipairs(chatChannels()) do
+			t0 = os.clock()
+			local ok, res = pcall(function() return ch:SendAsync(text) end)
+			local name = "Success"
+			if not ok then
+				name = "error"
+				details[#details + 1] = ch.Name .. ": " .. tostring(res):sub(1, 70)
+			else
+				pcall(function() if res and res.Status then name = res.Status.Name end end)
+				details[#details + 1] = ch.Name .. " = " .. name
+			end
+			if name == "Floodchecked" then return "flood", details end
+			if name == "InvalidPrivacySettings" or name == "InvalidTextChannelPermissions" then return "blocked", details end
+			if name == "TextFilterFailed" then return "filtered", details end
+			if ok and (name == "Success" or name == "Sending" or echoed(2.5)) then return "ok", details end
 		end
 	end
 	local ev = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
 	local say = ev and ev:FindFirstChild("SayMessageRequest")
 	if say then
+		t0 = os.clock()
 		say:FireServer(text, "All")
-		return "ok"
+		details[#details + 1] = "legacy chat remote fired"
+		echoed(2.5)
+		return "ok", details
 	end
-	return "fail"
+	details[#details + 1] = "no chat system found (ChatVersion = " .. tostring(TextChatService.ChatVersion) .. ")"
+	return "fail", details
 end
 
+local EXPLAIN = {
+	blocked = "Roblox says this account can't chat (account chat settings / parental controls).",
+	fail = "This game has no normal Roblox chat I can send through (custom chat?).",
+	filtered = "Roblox's filter rejected the message.",
+}
+
 -- Every message goes through one paced queue so Roblox's flood check never swallows it.
-local chatQueue, chatWorker, lastChatT, chatWarned = {}, false, 0, false
+local chatQueue, chatWorker, lastChatT, lastBanner = {}, false, 0, 0
 sendChat = function(text)
 	text = tostring(text):sub(1, 200)
 	if #chatQueue >= 14 then return end
@@ -364,14 +439,15 @@ sendChat = function(text)
 			local gap = 1.3 - (os.clock() - lastChatT)
 			if gap > 0 then task.wait(gap) end
 			lastChatT = os.clock()
-			local r = rawSend(item.text)
+			local okc, r, details = pcall(rawSend, item.text)
+			if not okc then r, details = "fail", { tostring(r):sub(1, 90) } end
 			if r == "flood" and item.tries < 3 then
 				item.tries = item.tries + 1
 				table.insert(chatQueue, 1, item)
 				task.wait(4)
-			elseif (r == "blocked" or r == "fail") and not chatWarned then
-				chatWarned = true
-				notify("Roblox or this game is blocking my chat messages, so other players can't see them. Check your account's chat settings.")
+			elseif r ~= "ok" and r ~= "flood" and os.clock() - lastBanner > 20 then
+				lastBanner = os.clock()
+				banner("CHAT PROBLEM (" .. r .. "): " .. (EXPLAIN[r] or "") .. " Details: " .. table.concat(details or {}, "; "), 190, 60, 60, 25)
 			end
 		end
 		chatWorker = false
