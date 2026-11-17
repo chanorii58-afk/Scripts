@@ -784,12 +784,54 @@ POSES.float = { fade = 0.5, keys = {
 		RH = { 6, 0, 3 }, LH = { -4, 0, -3 }, RK = { -12, 0, 0 }, LK = { -8, 0, 0 } } },
 } }
 
-POSES.kneel = { fade = 0.6, keys = {
-	{ 0, {} },
-	{ 1.0, { RH = { -8, 0, 4 }, RK = { -88, 0, 0 }, LH = { 88, 0, -3 }, LK = { -88, 0, 0 },
-		WA = { -10, 0, 0 }, NK = { -22, 0, 0 },
-		RS = { 45, 35, 0 }, RE = { 112, 0, 0 }, LS = { 30, 0, 0 }, LE = { 28, 0, 0 } } },
-} }
+-- Kneel: a few steps in, left foot forward, right knee drops to the floor, fist to the chest,
+-- head bowed with slow breathing, then it rises again. amt(t) = how far down the body is (0..1);
+-- the attach code uses it to lower the whole character in sync with the legs.
+do
+	local D = CONFIG.KneelTime
+	local down = {
+		RH = { -8, 0, 4 }, RK = { -88, 0, 0 }, LH = { 88, 0, -3 }, LK = { -88, 0, 0 },
+		WA = { -6, 0, 0 }, NK = { -10, 0, 0 },
+		RS = { 24, 16, 0 }, RE = { 44, 0, 0 }, LS = { 26, 0, 0 }, LE = { 30, 0, 0 },
+	}
+	local bow = {
+		RH = { -8, 0, 4 }, RK = { -88, 0, 0 }, LH = { 88, 0, -3 }, LK = { -88, 0, 0 },
+		WA = { -13, 0, 0 }, NK = { -34, 0, 0 },
+		RS = { 52, 38, 0 }, RE = { 118, 0, 0 }, LS = { 34, 0, 0 }, LE = { 26, 0, 0 },
+	}
+	local EMPTY = {}
+	local function amt(t)
+		if t < 0.7 then return 0 end
+		if t < 1.6 then return smooth((t - 0.7) / 0.9) end
+		if t < D - 1.4 then return 1 end
+		if t < D - 0.4 then return 1 - smooth((t - (D - 1.4)) / 1.0) end
+		return 0
+	end
+	local function fn(t)
+		if t < 0.7 then
+			-- stride toward the owner
+			local s = math.sin(t / 0.7 * math.pi * 2) * 20
+			return { RH = { s, 0, 0 }, LH = { -s, 0, 0 }, RS = { -s * 0.8, 0, 0 }, LS = { s * 0.8, 0, 0 } }
+		elseif t < 1.6 then
+			return lerpPose(EMPTY, down, smooth((t - 0.7) / 0.9))
+		elseif t < 2.5 then
+			return lerpPose(down, bow, smooth((t - 1.6) / 0.9))
+		elseif t < D - 2.0 then
+			local b = math.sin(t * 1.7)
+			local p = lerpPose(bow, bow, 0)
+			p.WA = { bow.WA[1] + b * 1.2, 0, 0 }
+			p.NK = { bow.NK[1] + math.sin(t * 1.7 + 0.6) * 1.8, 0, 0 }
+			p.RS = { bow.RS[1] + b * 0.8, bow.RS[2], 0 }
+			return p
+		elseif t < D - 1.4 then
+			return lerpPose(bow, down, smooth((t - (D - 2.0)) / 0.6))
+		elseif t < D - 0.4 then
+			return lerpPose(down, EMPTY, smooth((t - (D - 1.4)) / 1.0))
+		end
+		return EMPTY
+	end
+	POSES.kneel = { duration = D, fade = 0.4, amt = amt, fn = fn }
+end
 
 POSES.kiss = { duration = CONFIG.KissTime, fade = 0.45, keys = {
 	{ 0, {} },
@@ -1191,8 +1233,12 @@ local function attachStep(char, hrp, hum, dt, now)
 			local gy = groundBelow(p, char, ochar) or (oh.Position.Y - 3)
 			S.kneelPos = Vector3.new(p.X, gy, p.Z)
 		end
-		local pos = Vector3.new(S.kneelPos.X, S.kneelPos.Y + standHeight(hum, hrp) - 1.0, S.kneelPos.Z)
-		cf = CFrame.lookAt(pos, Vector3.new(oh.Position.X, pos.Y, oh.Position.Z))
+		local kt = now - S.attachT0
+		local depth = POSES.kneel.amt(kt)
+		local pos = Vector3.new(S.kneelPos.X, S.kneelPos.Y + standHeight(hum, hrp) - 1.05 * depth, S.kneelPos.Z)
+		local goal = CFrame.lookAt(pos, Vector3.new(oh.Position.X, pos.Y, oh.Position.Z))
+		local k = clampNum(kt / 0.7, 0, 1)
+		cf = (S.attachStartCF and k < 1) and S.attachStartCF:Lerp(goal, smooth(k)) or goal
 
 	elseif a == "kiss" then
 		if now > S.attachUntil then
@@ -1993,12 +2039,13 @@ end
 ----------------------------------------------------------------------
 -- Chat lines never start with "." so other servant scripts don't mistake them for commands
 local CMD_LINES = {
-	"Commands (1/6): .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
-	"Commands (2/6): .fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
-	"Commands (3/6): .leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
-	"Commands (4/6): .mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal",
-	"Commands (5/6): .reset .leave .rejoin .blind .unblind .deaf .undeaf | .help <cmd> explains one",
-	"Commands (6/6): say Activate unanchored manipulation mode to unlock !orbit !wall !stairs !release !clear (I tap parts to select them)",
+	"Commands (1/7): .say .headsit .fly .unfly .grab .ungrab .throw .dance .undance .spin .unspin .freeze .unfreeze .mute .unmute",
+	"Commands (2/7): .fling .follow .unfollow .bring .goto .security .nosecurity .carpet .nocarpet .praise .speed .jp .sword .unsword .vest .unvest",
+	"Commands (3/7): .leash .unleash .stand .unstand .starplatinum .speedboost .nospeedboost .orbit .unorbit .upsidedown .noupsidedown .kneel .kiss",
+	"Commands (4/7): .mforward .mbackward .mleft .mright .mjump .stop .mimic .unmimic .owner .unowner .ownertransfer .normal",
+	"Commands (5/7): .reset .leave .rejoin .blind .unblind .deaf .undeaf .equip <slot> .cat .praise me | .help <cmd> explains one",
+	"Commands (6/7): .play boombox [title] [author] (or t.boombox ...) - plays audio from the catalog. .play stop stops it",
+	"Commands (7/7): say Activate unanchored manipulation mode to unlock !orbit !wall !stairs !tsunami !domain expansion !stickfigure !house !select !release !clear",
 }
 local function showCommands()
 	for _, line in ipairs(CMD_LINES) do sendChat(line) end
@@ -2021,7 +2068,11 @@ local HELP = {
 	["goto"] = ".goto <player> - I teleport to that player (full name or just the start of it).",
 	security = ".security - I walkfling anyone who gets near you (never owners) and stop when they leave. Undo: .nosecurity",
 	carpet = ".carpet - I become your flying carpet: jump to go up, I slowly sink otherwise. Undo: .nocarpet",
-	praise = ".praise - I thank you in chat and cheer.",
+	praise = ".praise - I thank you in chat and cheer. '.praise me' makes me praise you.",
+	equip = ".equip <slot> - I equip the tool in that inventory slot (1 = first tool in my backpack). '.equip 0' or '.unequip' puts it away.",
+	cat = ".cat - I send a cat-girl message in chat. Nya~",
+	play = ".play boombox [title] [by author] - I equip my boombox and play that audio (closest match; random if no title). .play stop stops it.",
+	boombox = "t.boombox <title> [by <author>] - same as .play boombox <title> [by <author>].",
 	speed = ".speed <n> - sets my walk speed (0-500). Reset with .speed 16 or .normal",
 	jumppower = ".jumppower <n> (or .jp) - sets my jump power (0-1000). Reset with .jp 50 or .normal",
 	sword = ".sword - I'm held in your right hand like a sword. Undo: .unsword",
@@ -2048,10 +2099,15 @@ local HELP = {
 	rejoin = ".rejoin - I rejoin the game (same server if possible). The script reloads itself afterwards.",
 	blind = ".blind - my screen turns black. Undo: .unblind (or .normal)",
 	deaf = ".deaf - I can't see any chat messages. Undo: .undeaf (or .normal)",
-	activate = "Say 'Activate unanchored manipulation mode' to unlock !orbit !wall !stairs. I tap/drag across loose parts to pick them (max 60). Off: 'Deactivate unanchored manipulation mode'",
+	activate = "Say 'Activate unanchored manipulation mode' to unlock the ! commands. I tap/drag parts to select them (no limit); each owner/co gets their own section.",
 	["!orbit"] = "!orbit - my selected parts orbit you (needs the mode on). Stop with !release (parts drop) or !clear (also unselects).",
 	["!wall"] = "!wall - my selected parts form a wall in front of you and follow you. Stop with !release or !clear.",
 	["!stairs"] = "!stairs - my selected parts become stairs where you stand (they stay there). !release lets go, !clear also unselects.",
+	["!tsunami"] = "!tsunami - my selected parts rise into a wave, roll toward you and collapse in front of you.",
+	["!domain"] = "!domain expansion - my selected parts form a spinning sphere around you (like a domain) and follow you. !release ends it.",
+	["!stickfigure"] = "!stickfigure - my selected parts become a stick figure beside you that walks when you walk. !release ends it.",
+	["!house"] = "!house - my selected parts build a house on the exact spot where you said it. It stays there. !release lets go.",
+	["!select"] = "!select - the next parts I tap go into YOUR section (use it to switch between owners/co-owners).",
 	["!release"] = "!release - I let go of the parts I'm controlling; they stay selected. !clear lets go and unselects everything.",
 	["!clear"] = "!clear - I let go of every part and unselect them all.",
 	normal = ".normal - stops everything and resets speed, jump power, mute and more.",
@@ -2063,7 +2119,7 @@ local HELP_ALIAS = {
 	unsword = "sword", unvest = "vest", unleash = "leash", unstand = "stand",
 	nospeedboost = "speedboost", unorbit = "orbit", noupsidedown = "upsidedown",
 	unmimic = "mimic", unowner = "owner", unkneel = "kneel", commands = "cmds", jp = "jumppower",
-	ws = "speed", unblind = "blind", undeaf = "deaf",
+	ws = "speed", unblind = "blind", undeaf = "deaf", unequip = "equip",
 }
 local function showHelp(name)
 	name = trim(name):lower()
@@ -2073,7 +2129,12 @@ local function showHelp(name)
 		showCommands()
 		return
 	end
-	if bang then name = "!" .. name else name = HELP_ALIAS[name] or name end
+	if bang then
+		if name == "domain expansion" or name == "domainexpansion" then name = "domain" end
+		name = "!" .. name
+	else
+		name = HELP_ALIAS[name] or name
+	end
 	sendChat("Help: " .. (HELP[name] or ("I don't know a command called " .. name .. " - try .cmds")))
 end
 
@@ -2184,20 +2245,26 @@ local function update(dt)
 	poseStep(dt)
 end
 
+
 ;(function() -- own function scope: the main chunk is near Lua's 200-local limit
 ----------------------------------------------------------------------
 -- Unanchored manipulation mode
--- Only parts I tap/drag to select are used. No server-wide grabbing: a part can only be moved
--- if the game already lets me simulate it (stay close to it). Never characters, tools,
--- accessories or anchored parts.
+-- Every owner / co-owner who activates it gets their OWN section (their own selected parts,
+-- their own formations). I tap/drag parts to select them for whoever I'm currently serving.
+-- Nothing is grabbed server-wide: a part only moves if the game already lets me simulate it
+-- (stay close). Never characters, NPCs, tools, accessories or anchored parts.
 ----------------------------------------------------------------------
-local UAM_MAX = 60
-local U = { active = false, sel = {}, idx = {}, count = 0, n = 0, mode = nil, target = nil,
-	rel = {}, base = nil, cc = {}, boxes = {}, ang = 0, tick = 0 }
-local uamFolder = nil
-local GREEN, ORANGE = Color3.fromRGB(80, 220, 120), Color3.fromRGB(255, 170, 40)
+local SECS = {}
+local U = { active = false, current = nil, tick = 0 }
+local uamFolder, labelGui, label = nil, nil, nil
+local BAD = Color3.fromRGB(255, 170, 40)
 
-local function uamOwned(root)
+local function nameOf(uid)
+	local p = plrOf(uid)
+	return p and p.DisplayName or tostring(uid)
+end
+
+local function owned(root)
 	if isnetworkowner then
 		local ok, r = pcall(isnetworkowner, root)
 		if ok then return r end
@@ -2205,21 +2272,61 @@ local function uamOwned(root)
 	return true
 end
 
-local function uamRootFromPart(part)
-	if not (part and part:IsA("BasePart")) or part:IsA("Terrain") then return nil end
-	local root = part.AssemblyRootPart or part
-	if root.Anchored then return nil end
-	local a = root
-	while a and a ~= Workspace do
-		if a:FindFirstChildOfClass("Humanoid") or a:IsA("Tool") or a:IsA("Accessory") then return nil end
-		a = a.Parent
+local function getSec(uid)
+	local s = SECS[uid]
+	if not s then
+		s = { uid = uid, sel = {}, idx = {}, boxes = {}, cc = {}, rel = {}, count = 0, n = 0,
+			mode = nil, base = nil, t0 = 0, ang = 0, ph = 0, list = nil,
+			color = Color3.fromHSV((uid % 360) / 360, 0.65, 1) }
+		SECS[uid] = s
 	end
-	local s = root.Size
-	if math.max(s.X, s.Y, s.Z) > 120 then return nil end
-	return root
+	return s
 end
 
-local function uamBox(root)
+local function partOwner(root)
+	for uid, s in pairs(SECS) do
+		if s.sel[root] then return uid end
+	end
+	return nil
+end
+
+local function refreshLabel()
+	if not U.active then
+		if labelGui then
+			pcall(function() labelGui:Destroy() end)
+			labelGui, label = nil, nil
+		end
+		return
+	end
+	if not labelGui then
+		labelGui = Instance.new("ScreenGui")
+		labelGui.Name = "ServantUAM"
+		labelGui.ResetOnSpawn = false
+		labelGui.IgnoreGuiInset = true
+		labelGui.DisplayOrder = 2147482000
+		label = Instance.new("TextLabel")
+		label.AnchorPoint = Vector2.new(0.5, 0)
+		label.Position = UDim2.new(0.5, 0, 0, 8)
+		label.Size = UDim2.fromOffset(300, 26)
+		label.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+		label.BackgroundTransparency = 0.25
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 14
+		Instance.new("UICorner", label).CornerRadius = UDim.new(0, 8)
+		label.Parent = labelGui
+		safeParent(labelGui)
+	end
+	local s = U.current and SECS[U.current]
+	if s then
+		label.Text = "Selecting for " .. nameOf(s.uid) .. " - " .. s.count .. " parts"
+		label.TextColor3 = s.color
+	else
+		label.Text = "Unanchored mode"
+	end
+end
+
+local function newBox(root, color)
 	if not uamFolder or not uamFolder.Parent then
 		uamFolder = Instance.new("Folder")
 		uamFolder.Name = "ServantSel"
@@ -2228,195 +2335,451 @@ local function uamBox(root)
 	local b = Instance.new("SelectionBox")
 	b.Adornee = root
 	b.LineThickness = 0.06
-	b.Color3 = GREEN
-	b.SurfaceColor3 = GREEN
+	b.Color3 = color
+	b.SurfaceColor3 = color
 	b.SurfaceTransparency = 0.8
 	b.Parent = uamFolder
 	return b
 end
 
-local function uamSelect(root)
-	if U.sel[root] then return end
-	if U.count >= UAM_MAX then
-		notify("Selection is full (" .. UAM_MAX .. " parts).")
+local function rootFromPart(part)
+	if not (part and part:IsA("BasePart")) or part:IsA("Terrain") then return nil end
+	local root = part.AssemblyRootPart or part
+	if root.Anchored then return nil end
+	local a = root
+	while a and a ~= Workspace do
+		if a:FindFirstChildOfClass("Humanoid") or a:IsA("Tool") or a:IsA("Accessory") then return nil end
+		a = a.Parent
+	end
+	local sz = root.Size
+	if math.max(sz.X, sz.Y, sz.Z) > 120 then return nil end
+	return root
+end
+
+local function selectPart(s, root)
+	if s.sel[root] then return end
+	local other = partOwner(root)
+	if other then
+		notify("That part already belongs to " .. nameOf(other) .. ".")
 		return
 	end
-	U.n = U.n + 1
-	U.sel[root], U.idx[root] = true, U.n
-	U.count = U.count + 1
-	U.boxes[root] = uamBox(root)
+	s.n = s.n + 1
+	s.sel[root], s.idx[root] = true, s.n
+	s.count = s.count + 1
+	s.list = nil
+	s.boxes[root] = newBox(root, s.color)
+	refreshLabel()
 end
 
-local function uamRestore(root)
-	if U.cc[root] ~= nil and root.Parent then root.CanCollide = U.cc[root] end
-	U.cc[root] = nil
-	U.rel[root] = nil
+local function restore(s, root)
+	if s.cc[root] ~= nil and root.Parent then root.CanCollide = s.cc[root] end
+	s.cc[root] = nil
+	s.rel[root] = nil
 end
 
-local function uamDeselect(root)
-	if not U.sel[root] then return end
-	uamRestore(root)
-	if U.boxes[root] then pcall(function() U.boxes[root]:Destroy() end) end
-	U.boxes[root], U.sel[root], U.idx[root] = nil, nil, nil
-	U.count = U.count - 1
+local function deselectPart(s, root)
+	if not s.sel[root] then return end
+	restore(s, root)
+	if s.boxes[root] then pcall(function() s.boxes[root]:Destroy() end) end
+	s.boxes[root], s.sel[root], s.idx[root] = nil, nil, nil
+	s.count = s.count - 1
+	s.list = nil
 end
 
-local function uamRelease()
-	U.mode, U.base = nil, nil
-	for root in pairs(U.sel) do uamRestore(root) end
+local function releaseSec(s)
+	s.mode, s.base = nil, nil
+	for root in pairs(s.sel) do restore(s, root) end
 end
 
-local function uamClear()
-	uamRelease()
-	for root in pairs(U.sel) do uamDeselect(root) end
+local function clearSec(s)
+	releaseSec(s)
+	for root in pairs(s.sel) do deselectPart(s, root) end
+	refreshLabel()
 end
 
-local function uamOff()
-	if not U.active and U.count == 0 then return end
-	uamClear()
-	U.active = false
-	if uamFolder then
-		pcall(function() uamFolder:Destroy() end)
-		uamFolder = nil
+local function getList(s)
+	if not s.list then
+		local list = {}
+		for root in pairs(s.sel) do list[#list + 1] = root end
+		table.sort(list, function(a, b) return s.idx[a] < s.idx[b] end)
+		s.list = list
 	end
+	return s.list
 end
 
-local function uamList()
-	local list = {}
-	for root in pairs(U.sel) do
-		if root.Parent then list[#list + 1] = root else uamDeselect(root) end
+local OWN = setmetatable({}, { __mode = "k" }) -- ownership cache, refreshed twice a second
+local function place(root, cf)
+	if not root.Parent then return end
+	local o = OWN[root]
+	if o == nil then
+		o = owned(root)
+		OWN[root] = o
 	end
-	table.sort(list, function(a, b) return U.idx[a] < U.idx[b] end)
-	return list
-end
-
-local function uamPlace(root, cf)
-	if not uamOwned(root) then return end
+	if not o then return end
 	root.CFrame = cf
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
 end
 
-local function uamStep(dt)
-	if not U.active then return end
-	U.tick = U.tick + dt
-	if U.tick > 0.5 then
-		U.tick = 0
-		for root, box in pairs(U.boxes) do
-			if not root.Parent then
-				uamDeselect(root)
-			else
-				local c = uamOwned(root) and GREEN or ORANGE
-				box.Color3, box.SurfaceColor3 = c, c
-			end
-		end
-	end
-	local mode = U.mode
-	if not mode then return end
-	local oh = hrpOf(U.target)
-	if not oh then return end
-	local list = uamList()
-	if mode == "orbit" then
-		U.ang = U.ang + dt * 1.6
-		local n = #list
-		local per = math.max(1, math.ceil(n / 3))
-		for i, root in ipairs(list) do
-			local ring = (i - 1) % 3
-			local k = math.floor((i - 1) / 3)
-			local a = U.ang * (ring % 2 == 0 and 1 or -1) + (k / per) * math.pi * 2 + ring
-			local r = 8 + ring * 3
-			local h = 1.5 + ring * 2.2 + math.sin(U.ang * 2 + i) * 0.8
-			uamPlace(root, CFrame.new(oh.Position + Vector3.new(math.cos(a) * r, h, math.sin(a) * r)) * CFrame.Angles(0, a, 0))
-		end
-	elseif mode == "wall" then
-		for _, root in ipairs(list) do
-			if U.rel[root] then uamPlace(root, oh.CFrame * U.rel[root]) end
-		end
-	elseif mode == "stairs" and U.base then
-		for _, root in ipairs(list) do
-			if U.rel[root] then uamPlace(root, U.base * U.rel[root]) end
-		end
+local function noCollide(s, list)
+	for _, root in ipairs(list) do
+		if s.cc[root] == nil then s.cc[root] = root.CanCollide end
+		root.CanCollide = false
 	end
 end
 
-local function uamLayout(list, ground, fn)
+local function cells(list)
 	local cw, ch, cd = 2, 2, 2
 	for _, r in ipairs(list) do
 		cw, ch, cd = math.max(cw, r.Size.X), math.max(ch, r.Size.Y), math.max(cd, r.Size.Z)
 	end
-	cw, ch, cd = math.min(cw, 12), math.min(ch, 12), math.min(cd, 8)
-	for i, root in ipairs(list) do U.rel[root] = fn(i - 1, root, cw, ch, cd) end
+	return math.min(cw, 12), math.min(ch, 12), math.min(cd, 8)
 end
 
-local function uamCommand(name, who)
-	if name == "release" then
-		uamRelease()
+local function yawBase(oh, y)
+	local look = flat(oh.CFrame.LookVector)
+	local yaw = look.Magnitude > 0.01 and math.atan2(-look.X, -look.Z) or 0
+	return CFrame.new(oh.Position.X, y, oh.Position.Z) * CFrame.Angles(0, yaw, 0), yaw
+end
+
+----------------------------------------------------------------------
+-- Formations
+----------------------------------------------------------------------
+local MODES = {}
+
+local SLICE = 400 -- static formations only re-place this many parts per frame (keeps big builds smooth)
+local function sliceRange(s, n)
+	local from = (s.cur or 0) % math.max(n, 1)
+	local to = math.min(n, from + SLICE)
+	s.cur = to >= n and 0 or to
+	return from + 1, to
+end
+
+
+MODES.orbit = {
+	init = function(s, list) noCollide(s, list) end,
+	step = function(s, list, oh, dt)
+		s.ang = s.ang + dt * 1.6
+		local per = math.max(1, math.ceil(#list / 3))
+		for i, root in ipairs(list) do
+			local ring = (i - 1) % 3
+			local k = math.floor((i - 1) / 3)
+			local a = s.ang * (ring % 2 == 0 and 1 or -1) + (k / per) * math.pi * 2 + ring
+			local r = 8 + ring * 3
+			local h = 1.5 + ring * 2.2 + math.sin(s.ang * 2 + i) * 0.8
+			place(root, CFrame.new(oh.Position + Vector3.new(math.cos(a) * r, h, math.sin(a) * r)) * CFrame.Angles(0, a, 0))
+		end
+	end,
+}
+
+MODES.wall = {
+	init = function(s, list, oh, feet)
+		local cw, ch = cells(list)
+		local cols = math.max(1, math.ceil(math.sqrt(#list * 2)))
+		for i, root in ipairs(list) do
+			local col, row = (i - 1) % cols, math.floor((i - 1) / cols)
+			s.rel[root] = CFrame.new((col - (cols - 1) / 2) * cw, feet + row * ch + ch / 2, -9)
+		end
+	end,
+	step = function(s, list, oh)
+		for _, root in ipairs(list) do
+			if s.rel[root] then place(root, oh.CFrame * s.rel[root]) end
+		end
+	end,
+}
+
+MODES.stairs = {
+	init = function(s, list, oh, feet)
+		local cw, _, cd = cells(list)
+		s.base = yawBase(oh, oh.Position.Y)
+		for i, root in ipairs(list) do
+			local col, row = (i - 1) % 3, math.floor((i - 1) / 3)
+			s.rel[root] = CFrame.new((col - 1) * cw, feet + (row + 1) * 1.2 - root.Size.Y / 2, -(6 + row * cd))
+		end
+	end,
+	step = function(s, list)
+		if not s.base then return end
+		local from, to = sliceRange(s, #list)
+		for i = from, to do
+			local root = list[i]
+			if s.rel[root] then place(root, s.base * s.rel[root]) end
+		end
+	end,
+}
+
+-- a wave rises in front, rolls toward the owner (stopping short of them), then collapses
+MODES.tsunami = {
+	init = function(s, list, oh, feet)
+		noCollide(s, list)
+		local cw, ch = cells(list)
+		s.base = yawBase(oh, oh.Position.Y)
+		s.cols = math.max(2, math.ceil(math.sqrt(#list * 2.5)))
+		s.rows = math.max(1, math.ceil(#list / s.cols))
+		s.cw, s.ch, s.feet = cw, ch, feet
+	end,
+	step = function(s, list, oh, dt, now)
+		local t = now - s.t0
+		if t > 5.5 then
+			releaseSec(s)
+			return
+		end
+		local p = math.min(1, t / 3.5)
+		local pe = 1 - (1 - p) * (1 - p)
+		local dist = 75 - 62 * pe
+		local hf = 0.35 + 0.65 * (p * p * (3 - 2 * p))
+		local shake = t > 3.5 and math.sin(t * 30) * 0.15 or 0
+		for i, root in ipairs(list) do
+			local col, row = (i - 1) % s.cols, math.floor((i - 1) / s.cols)
+			local rr = row / s.rows
+			local x = (col - (s.cols - 1) / 2) * s.cw
+			local y = s.feet + row * s.ch * hf + s.ch / 2 + math.sin(t * 6 + col) * 0.4
+			local z = -dist + rr * rr * 7 * p + shake
+			place(root, s.base * CFrame.new(x, y, z) * CFrame.Angles(rr * 0.7 * p, 0, 0))
+		end
+	end,
+}
+
+-- a spinning shell of parts around the owner, like a domain
+MODES.domain = {
+	init = function(s, list, oh)
+		noCollide(s, list)
+		s.ctr = oh.Position
+	end,
+	step = function(s, list, oh, dt, now)
+		s.ang = s.ang + dt * 0.35
+		s.ctr = s.ctr:Lerp(oh.Position + Vector3.new(0, 2, 0), 1 - math.exp(-8 * dt))
+		local t = now - s.t0
+		local e = math.min(1, t / 1.5)
+		local R = 15 * (e * e * (3 - 2 * e)) + 0.1
+		local n = #list
+		for i, root in ipairs(list) do
+			local y = 1 - 2 * (i - 0.5) / n
+			local rr = math.sqrt(math.max(0, 1 - y * y))
+			local phi = (i - 1) * 2.399963 + s.ang
+			local dir = Vector3.new(math.cos(phi) * rr, y, math.sin(phi) * rr)
+			place(root, CFrame.lookAt(s.ctr + dir * R, s.ctr))
+		end
+	end,
+}
+
+local FIG = { "head", "torso", "armL", "armR", "legL", "legR" }
+local FRAC = { 0.16, 0.22, 0.13, 0.13, 0.18, 0.18 }
+
+-- a stick figure that stands beside the owner and walks when they walk
+MODES.stickfigure = {
+	init = function(s, list, oh, feet)
+		noCollide(s, list)
+		local n = #list
+		local counts = {}
+		if n < 6 then
+			for i = 1, 6 do counts[i] = (i <= n) and 1 or 0 end
+		else
+			local used = 0
+			for i = 1, 6 do
+				counts[i] = math.floor(n * FRAC[i])
+				used = used + counts[i]
+			end
+			local i = 2
+			while used < n do
+				counts[i] = counts[i] + 1
+				used = used + 1
+				i = i % 6 + 1
+			end
+		end
+		s.fig, s.feet, s.figCF = {}, feet, nil
+		local at = 1
+		for i = 1, 6 do
+			s.fig[FIG[i]] = {}
+			for _ = 1, counts[i] do
+				s.fig[FIG[i]][#s.fig[FIG[i]] + 1] = list[at]
+				at = at + 1
+			end
+		end
+	end,
+	step = function(s, list, oh, dt)
+		local speed = flat(oh.AssemblyLinearVelocity).Magnitude
+		s.ph = s.ph + speed * dt * 0.55
+		local swing = math.sin(s.ph) * 0.75 * math.min(1, speed / 8)
+		local target = yawBase(oh, oh.Position.Y + s.feet) * CFrame.new(7, 0, 0)
+		s.figCF = s.figCF and s.figCF:Lerp(target, 1 - math.exp(-6 * dt)) or target
+		local fcf = s.figCF
+		local function put(root, localPos)
+			place(root, CFrame.new(fcf:PointToWorldSpace(localPos)) * rotOnly(fcf))
+		end
+		local function limb(group, from, dirv, len, theta)
+			local v = CFrame.Angles(theta, 0, 0):VectorToWorldSpace(dirv.Unit * len)
+			local m = #group
+			for k, root in ipairs(group) do put(root, from + v * ((k - 0.5) / m)) end
+		end
+		local head = s.fig.head
+		for k, root in ipairs(head) do
+			local a = (k / #head) * math.pi * 2
+			put(root, Vector3.new(math.cos(a) * 1.2, 7.7 + math.sin(a) * 1.2, 0))
+		end
+		local torso = s.fig.torso
+		for k, root in ipairs(torso) do
+			put(root, Vector3.new(0, 6.4 - 2.2 * ((k - 0.5) / #torso), 0))
+		end
+		limb(s.fig.armL, Vector3.new(0, 6.0, 0), Vector3.new(-0.42, -0.9, 0), 2.6, -swing)
+		limb(s.fig.armR, Vector3.new(0, 6.0, 0), Vector3.new(0.42, -0.9, 0), 2.6, swing)
+		limb(s.fig.legL, Vector3.new(0, 4.2, 0), Vector3.new(-0.2, -1, 0), 4.2, swing)
+		limb(s.fig.legR, Vector3.new(0, 4.2, 0), Vector3.new(0.2, -1, 0), 4.2, -swing)
+	end,
+}
+
+-- a house around the exact spot where the command was said (it stays there).
+-- It grows to fit however many parts are selected.
+local function houseCount(k, h) return h * 4 * k - 4 + 2 * k * k end
+local function houseHeight(k) return 3 + math.floor(k / 8) end
+
+MODES.house = {
+	init = function(s, list, oh, feet)
+		local cw, ch = cells(list)
+		s.base = yawBase(oh, oh.Position.Y)
+		local n = #list
+		local k = 3
+		while houseCount(k, houseHeight(k)) < n and k < 400 do k = k + 1 end
+		local h = houseHeight(k)
+		local half = k * cw / 2
+		local door = math.floor((k - 1) / 2)
+		local slots = {}
+		for layer = 0, h - 1 do
+			local y = feet + layer * ch + ch / 2
+			for i = 0, k - 1 do
+				local c = (i + 0.5) * cw - half
+				if not (layer < 2 and (i == door or i == door + 1)) then
+					slots[#slots + 1] = Vector3.new(c, y, -half)
+				end
+				slots[#slots + 1] = Vector3.new(c, y, half)
+				slots[#slots + 1] = Vector3.new(-half, y, c)
+				slots[#slots + 1] = Vector3.new(half, y, c)
+			end
+		end
+		for i = 0, k - 1 do
+			for j = 0, k - 1 do
+				slots[#slots + 1] = Vector3.new((i + 0.5) * cw - half, feet + h * ch + ch / 2, (j + 0.5) * cw - half)
+			end
+		end
+		for i = 0, k - 1 do
+			for j = 0, k - 1 do
+				slots[#slots + 1] = Vector3.new((i + 0.5) * cw - half, feet - ch / 2, (j + 0.5) * cw - half)
+			end
+		end
+		for i, root in ipairs(list) do
+			if slots[i] then s.rel[root] = CFrame.new(slots[i]) end
+		end
+	end,
+	step = function(s, list)
+		if not s.base then return end
+		local from, to = sliceRange(s, #list)
+		for i = from, to do
+			local root = list[i]
+			if s.rel[root] then place(root, s.base * s.rel[root]) end
+		end
+	end,
+}
+
+----------------------------------------------------------------------
+-- Commands
+----------------------------------------------------------------------
+local function runCommand(c, who)
+	local s = SECS[who.UserId]
+	if not s then
+		sendChat("Say 'Activate unanchored manipulation mode' first.")
 		return
 	end
-	if name == "clear" then
-		uamClear()
+	if c == "select" then
+		U.current = who.UserId
+		refreshLabel()
+		sendChat("Now selecting parts for " .. who.DisplayName .. ".")
 		return
 	end
-	if U.count == 0 then
-		sendChat("I haven't selected any parts yet - I need to tap some first.")
+	if c == "release" then
+		releaseSec(s)
 		return
 	end
-	uamRelease()
-	U.target = who.UserId
-	local oh, list = hrpOf(who.UserId), uamList()
-	if not oh then return end
+	if c == "clear" then
+		clearSec(s)
+		return
+	end
+	if s.count == 0 then
+		sendChat("I haven't selected any parts for " .. who.DisplayName .. " yet - I need to tap some first.")
+		return
+	end
+	local oh = hrpOf(who.UserId)
+	local mode = MODES[c]
+	if not (oh and mode) then return end
+	releaseSec(s)
 	local ochar = charOf(who.UserId)
 	local ohum = ochar and ochar:FindFirstChildOfClass("Humanoid")
 	local feet = -standHeight(ohum, oh)
-	if name == "orbit" then
-		U.mode = "orbit"
-		for _, root in ipairs(list) do
-			U.cc[root] = root.CanCollide
-			root.CanCollide = false
-		end
-	elseif name == "wall" then
-		local cols = math.max(1, math.ceil(math.sqrt(#list * 2)))
-		uamLayout(list, feet, function(i, root, cw, ch)
-			local col, row = i % cols, math.floor(i / cols)
-			return CFrame.new((col - (cols - 1) / 2) * cw, feet + row * ch + ch / 2, -9)
-		end)
-		U.mode = "wall"
-	elseif name == "stairs" then
-		local look = flat(oh.CFrame.LookVector)
-		local yaw = look.Magnitude > 0.01 and math.atan2(-look.X, -look.Z) or 0
-		U.base = CFrame.new(oh.Position) * CFrame.Angles(0, yaw, 0)
-		uamLayout(list, feet, function(i, root, cw, ch, cd)
-			local col, row = i % 3, math.floor(i / 3)
-			return CFrame.new((col - 1) * cw, feet + (row + 1) * 1.2 - root.Size.Y / 2, -(6 + row * cd))
-		end)
-		U.mode = "stairs"
-	end
+	s.t0, s.ang, s.ph = os.clock(), 0, 0
+	s.mode = c
+	mode.init(s, getList(s), oh, feet)
 end
 
-local function uamParse(lower)
+local ALLOWED = { orbit = 1, wall = 1, stairs = 1, tsunami = 1, stickfigure = 1, house = 1,
+	release = 1, clear = 1, select = 1 }
+
+local function parse(lower)
 	if lower:match("^activate unanchored manipulation mode[%.!]*$") then return "on" end
 	if lower:match("^deactivate unanchored manipulation mode[%.!]*$") then return "off" end
-	local b = lower:match("^!(%a+)")
-	if b == "orbit" or b == "wall" or b == "stairs" or b == "release" or b == "clear" then return b end
+	local b = lower:match("^!([%a ]+)")
+	if not b then return nil end
+	b = b:gsub("%s+$", "")
+	b = b:gsub("%s+", " ")
+	if b == "domain expansion" or b == "domainexpansion" or b == "domain" then return "domain" end
+	if ALLOWED[b] then return b end
 	return nil
 end
 
-local function uamHandle(c, who)
+local function offAll()
+	for _, s in pairs(SECS) do clearSec(s) end
+	SECS = {}
+	U.active, U.current = false, nil
+	if uamFolder then
+		pcall(function() uamFolder:Destroy() end)
+		uamFolder = nil
+	end
+	refreshLabel()
+end
+
+local function handle(c, who)
 	if c == "on" then
-		U.active = true
-		sendChat("Unanchored manipulation mode is on. I'll tap the parts to use, then you say !orbit, !wall or !stairs.")
-		notify("Tap parts (or drag across them) to select. Green = I control it, orange = stay closer. Max " .. UAM_MAX .. ".")
+		local first = not U.active
+		getSec(who.UserId)
+		U.active, U.current = true, who.UserId
+		refreshLabel()
+		if first then
+			sendChat("Unanchored manipulation mode is on for " .. who.DisplayName .. ". I'll tap the parts, then you say !orbit, !wall, !stairs, !tsunami, !domain expansion, !stickfigure or !house.")
+			notify("Tap parts (or drag across them) to select. Orange outline = stay closer so the game lets me control it.")
+		else
+			sendChat("Now selecting parts for " .. who.DisplayName .. " (separate from the others).")
+		end
 	elseif c == "off" then
-		uamOff()
-		sendChat("Unanchored manipulation mode is off.")
+		local s = SECS[who.UserId]
+		if s then
+			clearSec(s)
+			SECS[who.UserId] = nil
+		end
+		if next(SECS) == nil then
+			offAll()
+		elseif U.current == who.UserId then
+			U.current = next(SECS)
+			refreshLabel()
+		end
+		sendChat("Unanchored manipulation mode is off for " .. who.DisplayName .. ".")
 	elseif not U.active then
 		sendChat("Say 'Activate unanchored manipulation mode' first.")
 	else
-		uamCommand(c, who)
+		runCommand(c, who)
 	end
 end
 
--- tap/click a part to toggle it, or hold and drag across parts to add them
+----------------------------------------------------------------------
+-- Input: tap a part to toggle it, or press and drag across parts to add them.
+-- Parts go into the section of whoever I'm currently selecting for (U.current).
+----------------------------------------------------------------------
 local pressing, pressedRoot, pressedPos, dragMoved = false, nil, nil, false
 local function pointerRoot(pos)
 	local cam = Workspace.CurrentCamera
@@ -2425,10 +2788,13 @@ local function pointerRoot(pos)
 	rp.FilterType = Enum.RaycastFilterType.Exclude
 	rp.FilterDescendantsInstances = { getChar() or cam, uamFolder or cam }
 	local hit = Workspace:Raycast(ray.Origin, ray.Direction * 2000, rp)
-	return hit and uamRootFromPart(hit.Instance) or nil
+	return hit and rootFromPart(hit.Instance) or nil
 end
 local function isPointer(t)
 	return t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch
+end
+local function curSec()
+	return U.current and SECS[U.current] or nil
 end
 track(UserInputService.InputBegan:Connect(function(input, processed)
 	if not U.active or processed or not isPointer(input.UserInputType) then return end
@@ -2440,22 +2806,80 @@ track(UserInputService.InputChanged:Connect(function(input)
 	local t = input.UserInputType
 	if t ~= Enum.UserInputType.MouseMovement and t ~= Enum.UserInputType.Touch then return end
 	if (input.Position - pressedPos).Magnitude > 10 then
-		if not dragMoved and pressedRoot then uamSelect(pressedRoot) end
+		local s = curSec()
+		if not s then return end
+		if not dragMoved and pressedRoot then selectPart(s, pressedRoot) end
 		dragMoved = true
 		local root = pointerRoot(input.Position)
-		if root then uamSelect(root) end
+		if root then selectPart(s, root) end
 	end
 end))
 track(UserInputService.InputEnded:Connect(function(input)
 	if not pressing or not isPointer(input.UserInputType) then return end
 	pressing = false
-	if U.active and not dragMoved and pressedRoot then
-		if U.sel[pressedRoot] then uamDeselect(pressedRoot) else uamSelect(pressedRoot) end
+	local s = curSec()
+	if U.active and s and not dragMoved and pressedRoot then
+		if s.sel[pressedRoot] then
+			deselectPart(s, pressedRoot)
+			refreshLabel()
+		else
+			selectPart(s, pressedRoot)
+		end
 	end
 	pressedRoot = nil
 end))
-track(RunService.Stepped:Connect(function(_, dt) pcall(uamStep, dt) end))
-UAMX.off, UAMX.parse, UAMX.handle = uamOff, uamParse, uamHandle
+
+----------------------------------------------------------------------
+-- Frame loop
+----------------------------------------------------------------------
+local function secStep(s, dt, now)
+	local mode = s.mode and MODES[s.mode]
+	if not mode then return end
+	local oh = hrpOf(s.uid)
+	if not oh then return end
+	-- drop parts that were destroyed
+	local list = getList(s)
+	local dead = false
+	for _, root in ipairs(list) do
+		if not root.Parent then dead = true break end
+	end
+	if dead then
+		for root in pairs(s.sel) do
+			if not root.Parent then deselectPart(s, root) end
+		end
+		list = getList(s)
+		refreshLabel()
+	end
+	if #list == 0 then return end
+	mode.step(s, list, oh, dt, now)
+end
+
+track(RunService.Stepped:Connect(function(_, dt)
+	if not U.active then return end
+	pcall(function()
+		local now = os.clock()
+		U.tick = U.tick + dt
+		if U.tick > 0.5 then
+			U.tick = 0
+			for _, s in pairs(SECS) do
+				for root, box in pairs(s.boxes) do
+					if not root.Parent then
+						deselectPart(s, root)
+					else
+						local o = owned(root)
+						OWN[root] = o
+						local c = o and s.color or BAD
+						box.Color3, box.SurfaceColor3 = c, c
+					end
+				end
+			end
+		end
+		for _, s in pairs(SECS) do secStep(s, dt, now) end
+	end)
+end))
+
+UAMX.off, UAMX.parse, UAMX.handle = offAll, parse, handle
+UAMX.test = { MODES = MODES, getSec = getSec, selectPart = selectPart, getList = getList, U = U }
 end)()
 
 ----------------------------------------------------------------------
@@ -2679,6 +3103,460 @@ reg({ "ownertransfer" }, function(_, raw, who)
 	setMainOwner(p)
 end)
 
+;(function() -- own function scope (main chunk is near the 200-local limit)
+----------------------------------------------------------------------
+-- .equip <slot>, .cat, .praise me, .play boombox ...
+----------------------------------------------------------------------
+local unpack = table.unpack or unpack
+local BP = function() return LocalPlayer:FindFirstChildOfClass("Backpack") end
+
+-- inventory numbering = order I first saw each tool (matches the hotbar unless it was rearranged)
+local known = {}
+local function toolList()
+	local present = {}
+	local bp, char = BP(), getChar()
+	local function scan(c)
+		if not c then return end
+		for _, t in ipairs(c:GetChildren()) do
+			if t:IsA("Tool") then
+				present[t] = true
+				local have = false
+				for _, k in ipairs(known) do
+					if k == t then have = true break end
+				end
+				if not have then known[#known + 1] = t end
+			end
+		end
+	end
+	scan(bp)
+	scan(char)
+	local out = {}
+	for _, t in ipairs(known) do
+		if present[t] then out[#out + 1] = t end
+	end
+	known = out
+	return out
+end
+
+local function equipTool(tool)
+	local hum = getHum()
+	if not hum then return false end
+	if tool.Parent == getChar() then return true end
+	pcall(function() hum:EquipTool(tool) end)
+	return true
+end
+
+COMMANDS["equip"] = function(args)
+	local n = tonumber(args[1] or "")
+	local hum = getHum()
+	if not hum then return end
+	if not n then
+		sendChat("Tell me a slot number, like .equip 1")
+		return
+	end
+	n = math.floor(n)
+	if n <= 0 then
+		pcall(function() hum:UnequipTools() end)
+		return
+	end
+	local list = toolList()
+	local tool = list[n]
+	if not tool then
+		sendChat("I don't have anything in slot " .. n .. ".")
+		return
+	end
+	equipTool(tool)
+end
+COMMANDS["unequip"] = function()
+	local hum = getHum()
+	if hum then pcall(function() hum:UnequipTools() end) end
+end
+
+local CAT = {
+	"Nyaa~ I'm your kitty servant, meow! (=^-w-^=)",
+	"Meow meow~ *purrs and rubs against you* Nya!",
+	"Nya nya~ did someone call for a cat girl? (^._.^)",
+	"Purrr~ I'll be a good kitty for you, nya!",
+	"Mrow~ pet me please, nya! =^.^=",
+}
+COMMANDS["cat"] = function()
+	sendChat(CAT[math.random(#CAT)])
+	pcall(playTemp, isR15() and "507770677" or "129423030", 3)
+end
+
+-- ".praise me" = I praise whoever said it (plain ".praise" still just thanks them)
+local oldPraise = COMMANDS["praise"]
+COMMANDS["praise"] = function(args, raw, who)
+	if (args[1] or ""):lower() == "me" then
+		local n = who.DisplayName
+		local lines = {
+			n .. " is amazing! The best owner anyone could ask for!",
+			"All hail " .. n .. "! So strong, so cool, so kind!",
+			n .. " is a legend and I'm lucky to serve them!",
+			"Nobody is as awesome as " .. n .. "! Truly the greatest!",
+		}
+		sendChat(lines[math.random(#lines)])
+		pcall(playTemp, isR15() and "507770677" or "129423030", 3)
+	elseif oldPraise then
+		oldPraise(args, raw, who)
+	end
+end
+
+----------------------------------------------------------------------
+-- Boombox
+----------------------------------------------------------------------
+local httpReq = (syn and syn.request) or (http and http.request) or http_request or request
+	or (fluxus and fluxus.request)
+
+local function httpGet(url)
+	if httpReq then
+		local ok, res = pcall(httpReq, { Url = url, Method = "GET", Headers = { Accept = "application/json" } })
+		if ok and type(res) == "table" then
+			local code = res.StatusCode or res.Status
+			if type(res.Body) == "string" and res.Body ~= "" and (code == nil or code == 200) then
+				return res.Body
+			end
+		end
+	end
+	local ok, body = pcall(function() return game:HttpGet(url) end)
+	if ok and type(body) == "string" and body ~= "" then return body end
+	return nil
+end
+
+local function decode(body)
+	local ok, d = pcall(function() return HttpService:JSONDecode(body) end)
+	return ok and d or nil
+end
+
+-- pull {id, name, author} out of whatever shape the endpoint returned
+local function collect(node, out, depth)
+	if type(node) ~= "table" or depth > 7 then return end
+	local a = type(node.asset) == "table" and node.asset or node
+	local id = tonumber(a.id or a.assetId or node.id)
+	local nm = a.name or a.title or node.name or node.title
+	if id and type(nm) == "string" then
+		local cr = node.creator or a.creator
+		local author = ""
+		if type(cr) == "table" then
+			author = tostring(cr.name or cr.Name or cr.username or "")
+		end
+		if author == "" then author = tostring(node.creatorName or a.creatorName or node.creatorTargetName or "") end
+		out[#out + 1] = { id = id, name = nm, author = author }
+		return
+	end
+	for _, v in pairs(node) do collect(v, out, depth + 1) end
+end
+
+local function collectIds(node, ids, depth)
+	if type(node) ~= "table" or depth > 4 then return end
+	if tonumber(node.id) and #ids < 50 then
+		ids[#ids + 1] = tonumber(node.id)
+		return
+	end
+	for _, v in pairs(node) do collectIds(v, ids, depth + 1) end
+end
+
+local goodUrl = nil -- which endpoint has actually returned results so far
+local function search(q)
+	local enc = HttpService:UrlEncode(q)
+	local urls = {
+		"https://apis.roblox.com/toolbox-service/v1/marketplace/3?keyword=" .. enc .. "&num=30&pageNumber=0",
+		"https://apis.roblox.com/toolbox-service/v2/assets:search?searchCategoryType=Audio&query=" .. enc .. "&maxPageSize=30",
+	}
+	for i, u in ipairs(urls) do
+		if goodUrl == nil or goodUrl == i then
+			local body = httpGet(u)
+			local data = body and decode(body)
+			if data then
+				local out = {}
+				collect(data, out, 0)
+				if #out == 0 then
+					local ids = {}
+					collectIds(data, ids, 0)
+					if #ids > 0 then
+						local d2 = decode(httpGet("https://apis.roblox.com/toolbox-service/v1/items/details?assetIds=" .. table.concat(ids, ",")) or "")
+						if d2 then collect(d2, out, 0) end
+						if #out == 0 then
+							for _, id in ipairs(ids) do out[#out + 1] = { id = id, name = "", author = "" } end
+						end
+					end
+				end
+				if #out > 0 then
+					goodUrl = i
+					return out
+				end
+			end
+		end
+	end
+	return {}
+end
+
+local function norm(s)
+	local r = tostring(s or ""):lower()
+	r = r:gsub("[%p%c]", " ")
+	r = r:gsub("%s+", " ")
+	return (r:gsub("^ +", ""):gsub(" +$", ""))
+end
+local function tokens(s)
+	local t = {}
+	for w in norm(s):gmatch("%S+") do
+		if #w >= 2 then t[#t + 1] = w end
+	end
+	return t
+end
+local function overlap(qtok, text)
+	if #qtok == 0 then return 0 end
+	local n, hit = norm(text), 0
+	for _, w in ipairs(qtok) do
+		if n:find(w, 1, true) then hit = hit + 1 end
+	end
+	return hit / #qtok
+end
+
+local function score(c, title, author, rank, total)
+	local tt, at = tokens(title), tokens(author)
+	local nm = norm(c.name)
+	local s = overlap(tt, c.name)
+	local nt = norm(title)
+	if nt ~= "" and nm:find(nt, 1, true) then s = s + 0.5 end
+	local ca = norm(c.author)
+	if #at > 0 then
+		local both = overlap(at, c.author)
+		s = s + both * 1.0
+		if both == 0 then s = s + overlap(at, c.name) * 0.3 end
+	elseif #ca >= 3 and norm(title):find(ca, 1, true) then
+		s = s + 0.5
+	end
+	return s + (total - rank) / (total * 100) -- keep the search's own order as a tiebreak
+end
+
+local SEPS = { " by ", " | ", " - ", " \226\128\147 ", ", " }
+local function splitTitleAuthor(s)
+	s = trim(s)
+	local t, a = s:match("^%(([^%)]+)%)%s*%(([^%)]+)%)$")
+	if t then return trim(t), trim(a) end
+	local inner = s:match("^%(([^%)]+)%)$")
+	if inner then s = trim(inner) end
+	local low = s:lower()
+	for _, sep in ipairs(SEPS) do
+		local i, j = low:find(sep, 1, true)
+		if i and i > 1 and j < #s then return trim(s:sub(1, i - 1)), trim(s:sub(j + 1)) end
+	end
+	return s, ""
+end
+
+local RANDOM_WORDS = { "lofi", "phonk", "meme", "funny", "epic", "chill", "remix", "anime", "nightcore",
+	"vaporwave", "trap", "synthwave", "orchestral", "retro", "jazz", "rock" }
+
+local function findAudio(title, author)
+	local tries, seen = {}, {}
+	local function add(q)
+		q = trim(q)
+		if q ~= "" and not seen[q:lower()] then
+			seen[q:lower()] = true
+			tries[#tries + 1] = q
+		end
+	end
+	if author ~= "" then add(title .. " " .. author) end
+	add(title)
+	local words = {}
+	for w in title:gmatch("%S+") do words[#words + 1] = w end
+	for n = #words - 1, 1, -1 do add(table.concat(words, " ", 1, n)) end
+	local byLen = {}
+	for _, w in ipairs(words) do
+		if #w >= 3 then byLen[#byLen + 1] = w end
+	end
+	table.sort(byLen, function(a, b) return #a > #b end)
+	for _, w in ipairs(byLen) do add(w) end
+	if author ~= "" then add(author) end
+
+	local best, bestScore = nil, -1
+	local tt = tokens(title)
+	for i, q in ipairs(tries) do
+		if i > 7 then break end
+		local res = search(q)
+		for rank, c in ipairs(res) do
+			local sc = score(c, title, author, rank, #res)
+			if sc > bestScore then best, bestScore = c, sc end
+		end
+		if best then
+			local authorOk = author == "" or overlap(tokens(author), best.author) > 0.5
+			if overlap(tt, best.name) >= 0.99 and authorOk then break end
+		end
+	end
+	return best
+end
+
+local function randomAudio()
+	local ws = {}
+	for _, w in ipairs(RANDOM_WORDS) do ws[#ws + 1] = w end
+	for _ = 1, 3 do
+		local w = table.remove(ws, math.random(#ws))
+		local res = search(w)
+		if #res > 0 then return res[math.random(math.min(#res, 25))] end
+	end
+	return nil
+end
+
+local function findBoombox()
+	local function look(container, pat)
+		if not container then return nil end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and t.Name:lower():find(pat) then return t end
+		end
+	end
+	for _, pat in ipairs({ "boom", "jukebox", "radio", "stereo", "music" }) do
+		local t = look(getChar(), pat) or look(BP(), pat)
+		if t then return t end
+	end
+	return nil
+end
+
+local function soundPlaying(id, tool)
+	local needle = tostring(id)
+	for _, root in ipairs({ getChar(), tool, Workspace }) do
+		if root then
+			local ok, found = pcall(function()
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA("Sound") and d.IsPlaying and tostring(d.SoundId):find(needle, 1, true) then return true end
+				end
+				return false
+			end)
+			if ok and found then return true end
+		end
+	end
+	return false
+end
+
+local function fireAll(tool, ...)
+	local args, n = { ... }, 0
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("RemoteEvent") then
+			n = n + 1
+			pcall(function() d:FireServer(unpack(args)) end)
+		end
+	end
+	return n
+end
+
+-- some boomboxes use a text box + PLAY button instead of a remote
+local function guiPlay(id)
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pg then return false end
+	local did = false
+	pcall(function()
+		for _, tb in ipairs(pg:GetDescendants()) do
+			if tb:IsA("TextBox") then
+				local sg, hit = tb:FindFirstAncestorOfClass("ScreenGui"), false
+				local a = tb
+				while a and a ~= pg do
+					if a.Name:lower():find("boom") or a.Name:lower():find("music") or a.Name:lower():find("radio") then hit = true end
+					a = a.Parent
+				end
+				if hit and sg then
+					tb.Text = tostring(id)
+					for _, b in ipairs(sg:GetDescendants()) do
+						if (b:IsA("TextButton") or b:IsA("ImageButton")) then
+							local nm = (b.Name .. " " .. (b:IsA("TextButton") and b.Text or "")):lower()
+							if nm:find("play") and not nm:find("stop") then
+								if firesignal then
+									pcall(firesignal, b.MouseButton1Click)
+									pcall(firesignal, b.Activated)
+								end
+								did = true
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+	return did
+end
+
+local playGen = 0
+local function say(msg) sendChat((msg:gsub("^%.+", ""))) end
+
+local function playAudio(tool, c)
+	local id = c.id
+	local attempts = {
+		function() return fireAll(tool, "PlaySong", id) end,
+		function() return fireAll(tool, "Play", id) end,
+		function() return fireAll(tool, "play", id) end,
+		function() return fireAll(tool, "PlaySong", "rbxassetid://" .. id) end,
+		function() return fireAll(tool, id) end,
+		function() return guiPlay(id) and 1 or 0 end,
+	}
+	for _, fn in ipairs(attempts) do
+		local sent = fn()
+		if sent and sent > 0 then
+			for _ = 1, 8 do
+				task.wait(0.35)
+				if soundPlaying(id, tool) then return true end
+			end
+		end
+	end
+	return false
+end
+
+local function stopBoombox()
+	local tool = findBoombox()
+	if not tool then return end
+	fireAll(tool, "Stop")
+	fireAll(tool, "StopSong")
+	local hum = getHum()
+	if hum then pcall(function() hum:UnequipTools() end) end
+end
+
+COMMANDS["play"] = function(args, raw)
+	local first = (args[1] or ""):lower()
+	if first ~= "boombox" and first ~= "stop" then return end
+	local rest = trim(first == "boombox" and raw:sub(8) or raw)
+	if rest:lower() == "stop" then
+		playGen = playGen + 1
+		stopBoombox()
+		return
+	end
+	playGen = playGen + 1
+	local gen = playGen
+	task.spawn(function()
+		local tool = findBoombox()
+		if not tool then
+			say("I need boombox.")
+			return
+		end
+		local c
+		local direct = rest:match("^(%d%d%d%d%d+)$")
+		if direct then
+			c = { id = tonumber(direct), name = "audio " .. direct, author = "" }
+		elseif rest == "" then
+			c = randomAudio()
+		else
+			local title, author = splitTitleAuthor(rest)
+			c = findAudio(title, author)
+		end
+		if gen ~= playGen then return end
+		if not c then
+			say("no audio found")
+			return
+		end
+		equipTool(tool)
+		task.wait(0.6)
+		if gen ~= playGen then return end
+		local ok = playAudio(tool, c)
+		if gen ~= playGen then return end
+		local label = c.name ~= "" and c.name or ("audio " .. c.id)
+		label = label:sub(1, 70)
+		if c.author ~= "" then label = label .. " by " .. c.author:sub(1, 30) end
+		if ok then
+			say("Now playing: " .. label .. " (" .. c.id .. ")")
+		else
+			say("I tried to play " .. label .. " (" .. c.id .. ") but my boombox didn't answer.")
+		end
+	end)
+end
+end)()
+
 local lastKey, lastCmdT = nil, 0
 local function onChat(plr, msg)
 	if not isAuth(plr.UserId) then return end
@@ -2695,6 +3573,8 @@ local function onChat(plr, msg)
 	local cmd, rest
 	if lower:match("^stop[%.!]*$") then
 		cmd, rest = "stop", ""
+	elseif lower:match("^t%.boombox%f[%A]") then
+		cmd, rest = "play", "boombox" .. msg:sub(10)
 	elseif msg:sub(1, #CONFIG.Prefix) == CONFIG.Prefix then
 		cmd, rest = msg:sub(#CONFIG.Prefix + 1):match("^(%S+)%s*(.*)$")
 	end
