@@ -15,6 +15,7 @@ local CONFIG = {
 	PublicChat = true,
 	ChatGap = 1.3,
 	PerPage = 10,
+	FetchSize = 30,
 	MaxPage = 1000,
 
 	Access = "everyone",
@@ -31,6 +32,9 @@ local CONFIG = {
 local NONE_MSG = "audio may have been removed/banned"
 
 local conns, made, gone = {}, {}, false
+local cleanupFns = {}
+local OWN_GUI = { BoomboxToggles = true, BoomboxBanner = true }
+local UI = { fly = false, hide = false, watch = function() end }
 local function track(c)
 	conns[#conns + 1] = c
 	return c
@@ -224,6 +228,7 @@ local httpReq = (syn and syn.request) or (http and http.request) or http_request
 local LASTERR = nil
 
 local function httpGet(url)
+	task.wait()
 	if httpReq then
 		local ok, res = pcall(httpReq, { Url = url, Method = "GET", Headers = { Accept = "application/json" } })
 		if ok and type(res) == "table" then
@@ -305,8 +310,12 @@ end
 local function fetchEp(c, q, k, ep)
 	local enc = HttpService:UrlEncode(q)
 	if ep == 1 then
-		local data = decode(httpGet("https://apis.roblox.com/toolbox-service/v1/marketplace/3?keyword=" .. enc
-			.. "&num=" .. CONFIG.PerPage .. "&pageNumber=" .. k))
+		local base = "https://apis.roblox.com/toolbox-service/v1/marketplace/3?keyword=" .. enc
+		local data = decode(httpGet(base .. "&num=" .. CONFIG.FetchSize .. "&pageNumber=" .. k))
+		if not data and c.P == nil and CONFIG.FetchSize > CONFIG.PerPage then
+			CONFIG.FetchSize = CONFIG.PerPage
+			data = decode(httpGet(base .. "&num=" .. CONFIG.PerPage .. "&pageNumber=" .. k))
+		end
 		if not data then return nil end
 		return parseResponse(data)
 	end
@@ -518,6 +527,7 @@ local function strictScore(c, qw, aw)
 	else
 		sc = 50
 	end
+	local frac = 1
 	if #aw > 0 then
 		local hit = 0
 		for _, w in ipairs(aw) do
@@ -527,11 +537,12 @@ local function strictScore(c, qw, aw)
 				hit = hit + 0.8
 			end
 		end
-		sc = sc + 25 * hit / #aw
+		frac = hit / #aw
+		sc = sc + 25 * frac
 	end
 	local extra = #nl - #qw
 	if extra > 0 then sc = sc - math.min(extra, 20) * 0.4 end
-	return sc
+	return sc, frac
 end
 
 local function strictFind(title, author, want)
@@ -562,14 +573,16 @@ local function strictFind(title, author, want)
 	if author ~= "" then addV(author) end
 
 	local found, order = {}, {}
+	local authorHit = false
 	for _, q in ipairs(variants) do
 		local idx, exact, strong = 0, 0, 0
 		while idx < CONFIG.StrictDepth do
 			local got = getItems(q, idx, CONFIG.PerPage)
 			if #got == 0 then break end
 			for _, e in ipairs(got) do
-				local sc = strictScore(e.item, qw, aw)
+				local sc, frac = strictScore(e.item, qw, aw)
 				if sc then
+					if frac >= 0.99 then authorHit = true end
 					sc = sc + 0.1 * math.max(0, 1 - e.idx / 400)
 					local prev = found[e.item.id]
 					if not prev then
@@ -583,7 +596,8 @@ local function strictFind(title, author, want)
 				end
 			end
 			idx = idx + CONFIG.PerPage
-			if exact >= want or #got < CONFIG.PerPage then break end
+			if #got < CONFIG.PerPage or exact >= want then break end
+			if exact >= 1 and #order >= want and (#aw == 0 or authorHit) then break end
 		end
 		if strong >= 1 then break end
 	end
@@ -725,29 +739,92 @@ end
 local function equipTool(tool)
 	local hum = getHum()
 	if not hum then return false end
+	UI.watch(tool)
 	if tool.Parent == getChar() then return true end
+	if UI.fly then
+		pcall(function() tool.Parent = getChar() end)
+		return true
+	end
 	pcall(function() hum:EquipTool(tool) end)
 	return true
 end
 
-local function findSound(id, tool)
-	local needle = tostring(id)
-	for _, root in ipairs({ getChar(), tool, Workspace }) do
-		if root then
-			local ok, found = pcall(function()
-				for _, d in ipairs(root:GetDescendants()) do
-					if d:IsA("Sound") and d.IsPlaying and tostring(d.SoundId):find(needle, 1, true) then return d end
-				end
-				return nil
-			end)
-			if ok and found then return found end
+local SC = { map = {}, n = 0, deep = {} }
+local SoundService = nil
+pcall(function() SoundService = game:GetService("SoundService") end)
+
+local function soundMatches(d, needle)
+	return d.IsPlaying and tostring(d.SoundId):find(needle, 1, true) ~= nil
+end
+
+local function scanRoot(root, needle)
+	local ok, found = pcall(function()
+		if root:IsA("Sound") then
+			if soundMatches(root, needle) then return root end
+			return nil
+		end
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("Sound") and soundMatches(d, needle) then return d end
+		end
+		return nil
+	end)
+	if ok then return found end
+	return nil
+end
+
+local function deepFind(needle)
+	local now = os.clock()
+	if SC.deep[needle] and now - SC.deep[needle] < 8 then return nil end
+	SC.deep[needle] = now
+	local mine = getChar()
+	local roots = {}
+	local ok, kids = pcall(function() return Workspace:GetChildren() end)
+	if ok then
+		for _, k in ipairs(kids) do
+			local skip = (k == mine) or k:IsA("Terrain") or k:IsA("Camera")
+			if not skip then
+				local okp, owner = pcall(function() return Players:GetPlayerFromCharacter(k) end)
+				if okp and owner then skip = true end
+			end
+			if not skip then roots[#roots + 1] = k end
+		end
+	end
+	if SoundService then roots[#roots + 1] = SoundService end
+	local started = os.clock()
+	for i, root in ipairs(roots) do
+		local s = scanRoot(root, needle)
+		if s then return s end
+		if i % 4 == 0 then
+			task.wait()
+			if os.clock() - started > 3 then break end
 		end
 	end
 	return nil
 end
 
-local function soundPlaying(id, tool)
-	return findSound(id, tool) ~= nil
+local function findSound(id, tool, deep)
+	local needle = tostring(id)
+	local cached = SC.map[needle]
+	if cached then
+		local ok, good = pcall(function() return cached.Parent ~= nil and soundMatches(cached, needle) end)
+		if ok and good then return cached end
+		SC.map[needle] = nil
+	end
+	local found = nil
+	for _, root in ipairs({ tool or false, getChar() or false }) do
+		if root and not found then found = scanRoot(root, needle) end
+	end
+	if not found and deep then found = deepFind(needle) end
+	if found then
+		if SC.n >= 30 then SC.map, SC.n = {}, 0 end
+		SC.map[needle] = found
+		SC.n = SC.n + 1
+	end
+	return found
+end
+
+local function soundPlaying(id, tool, deep)
+	return findSound(id, tool, deep) ~= nil
 end
 
 local function fireAll(tool, ...)
@@ -761,35 +838,48 @@ local function fireAll(tool, ...)
 	return n
 end
 
+local function nameLooksLikeBoombox(node, stop)
+	local a = node
+	while a and a ~= stop do
+		local n = a.Name:lower()
+		if n:find("boom") or n:find("music") or n:find("radio") then return true end
+		a = a.Parent
+	end
+	return false
+end
+
 local function guiPlay(id)
 	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
 	if not pg then return false end
 	local did = false
 	pcall(function()
-		for _, tb in ipairs(pg:GetDescendants()) do
-			if tb:IsA("TextBox") then
-				local sg, hit = tb:FindFirstAncestorOfClass("ScreenGui"), false
-				local a = tb
-				while a and a ~= pg do
-					local n = a.Name:lower()
-					if n:find("boom") or n:find("music") or n:find("radio") then hit = true end
-					a = a.Parent
+		for _, sg in ipairs(pg:GetChildren()) do
+			if sg:IsA("ScreenGui") and not OWN_GUI[sg.Name] then
+				local buttons, hit = {}, false
+				local desc = sg:GetDescendants()
+				for _, d in ipairs(desc) do
+					if d:IsA("TextBox") then
+						if nameLooksLikeBoombox(d, pg) then
+							d.Text = tostring(id)
+							hit = true
+						end
+					elseif d:IsA("TextButton") or d:IsA("ImageButton") then
+						buttons[#buttons + 1] = d
+					end
 				end
-				if hit and sg then
-					tb.Text = tostring(id)
-					for _, b in ipairs(sg:GetDescendants()) do
-						if b:IsA("TextButton") or b:IsA("ImageButton") then
-							local nm = (b.Name .. " " .. (b:IsA("TextButton") and b.Text or "")):lower()
-							if nm:find("play") and not nm:find("stop") then
-								if firesignal then
-									pcall(firesignal, b.MouseButton1Click)
-									pcall(firesignal, b.Activated)
-								end
-								did = true
+				if hit then
+					for _, b in ipairs(buttons) do
+						local nm = (b.Name .. " " .. (b:IsA("TextButton") and b.Text or "")):lower()
+						if nm:find("play") and not nm:find("stop") then
+							if firesignal then
+								pcall(firesignal, b.MouseButton1Click)
+								pcall(firesignal, b.Activated)
 							end
+							did = true
 						end
 					end
 				end
+				if #desc > 800 then task.wait() end
 			end
 		end
 	end)
@@ -854,13 +944,16 @@ local function playAudio(tool, c, quick)
 	for i = 1, #forms do
 		if i ~= goodForm then order[#order + 1] = i end
 	end
+	local deepTried = false
 	for n, i in ipairs(order) do
 		if quick and n > 2 then break end
 		local sent = forms[i]()
 		if sent and sent > 0 then
-			for _ = 1, quick and 6 or 8 do
+			for pollNo = 1, quick and 6 or 8 do
 				task.wait(0.35)
-				if soundPlaying(id, tool) then
+				local deep = (not deepTried) and pollNo >= 4
+				if deep then deepTried = true end
+				if soundPlaying(id, tool, deep) then
 					goodForm = i
 					if CONFIG.Volume ~= nil then
 						applyVolume(tool, id)
@@ -883,7 +976,7 @@ local function stopBoombox()
 	fireAll(tool, "Stop")
 	fireAll(tool, "StopSong")
 	local hum = getHum()
-	if hum then pcall(function() hum:UnequipTools() end) end
+	if hum and not UI.fly then pcall(function() hum:UnequipTools() end) end
 end
 
 local function label(c)
@@ -1840,6 +1933,242 @@ local function doAlbum(rest, who)
 	end
 end
 
+do
+	local RunService = game:GetService("RunService")
+	local FLY = { on = false, tool = nil, handle = nil, angle = 0, nextFind = 0, nextParent = 0, orig = {} }
+	local HIDE = { on = false, list = {}, conns = {}, equipAt = -100, watched = setmetatable({}, { __mode = "k" }) }
+	local WORDS = { "boom", "music", "radio", "jukebox", "stereo", "song", "audio" }
+	local gui, flyBtn, hideBtn, flyConn
+	local refresh
+
+	local function gripOf(char, handle)
+		for _, hname in ipairs({ "RightHand", "Right Arm" }) do
+			local hand = char:FindFirstChild(hname)
+			if hand then
+				for _, j in ipairs(hand:GetChildren()) do
+					if j.Name == "RightGrip" and j.Part1 == handle then return j, hand end
+				end
+			end
+		end
+		return nil
+	end
+
+	local function releaseGrips()
+		for grip, c0 in pairs(FLY.orig) do
+			pcall(function() grip.C0 = c0 end)
+		end
+		FLY.orig = {}
+	end
+
+	local function flyStep(dt)
+		local char = getChar()
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		local hum = getHum()
+		if not hrp or not hum or hum.Health <= 0 then return end
+		local now = os.clock()
+		local tool = FLY.tool
+		if not tool or not tool.Parent then
+			if now < FLY.nextFind then return end
+			FLY.nextFind = now + 0.5
+			tool = findBoombox()
+			FLY.tool, FLY.handle = tool, nil
+			if not tool then return end
+			UI.watch(tool)
+		end
+		if tool.Parent ~= char then
+			if now < FLY.nextParent then return end
+			FLY.nextParent = now + 0.25
+			pcall(function() tool.Parent = char end)
+			return
+		end
+		local handle = FLY.handle
+		if not handle or handle.Parent ~= tool then
+			handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+			FLY.handle = handle
+			if not handle then return end
+		end
+		local grip, hand = gripOf(char, handle)
+		if not grip then return end
+		if FLY.orig[grip] == nil then FLY.orig[grip] = grip.C0 end
+		FLY.angle = FLY.angle + dt * 1.5
+		local a = FLY.angle
+		local center = hrp.Position
+		local pos = center + Vector3.new(math.cos(a) * 5, 2.5 + math.sin(a * 2) * 0.6, math.sin(a) * 5)
+		local target = CFrame.new(pos, center + Vector3.new(0, 2, 0))
+		grip.C0 = hand.CFrame:Inverse() * target * grip.C1
+	end
+
+	local function setFly(on)
+		if on == FLY.on then return true end
+		if on then
+			local tool = findBoombox()
+			if not tool then
+				note("I need boombox.")
+				return false
+			end
+			FLY.on, UI.fly = true, true
+			FLY.tool, FLY.handle, FLY.nextParent = tool, nil, 0
+			UI.watch(tool)
+			if tool.Parent ~= getChar() then pcall(function() tool.Parent = getChar() end) end
+			flyConn = RunService.Heartbeat:Connect(function(dt)
+				local ok, err = pcall(flyStep, dt)
+				if not ok then FLY.err = err end
+			end)
+		else
+			FLY.on, UI.fly = false, false
+			if flyConn then
+				flyConn:Disconnect()
+				flyConn = nil
+			end
+			releaseGrips()
+		end
+		refresh()
+		return true
+	end
+
+	local function boomName(n)
+		n = tostring(n):lower()
+		for _, w in ipairs(WORDS) do
+			if n:find(w, 1, true) then return true end
+		end
+		return false
+	end
+
+	local function hideGui(sg)
+		if HIDE.list[sg] ~= nil then return end
+		local ok, was = pcall(function()
+			local e = sg.Enabled
+			sg.Enabled = false
+			return e
+		end)
+		if not ok then return end
+		HIDE.list[sg] = (was ~= false)
+		pcall(function()
+			HIDE.conns[#HIDE.conns + 1] = sg:GetPropertyChangedSignal("Enabled"):Connect(function()
+				if HIDE.on and sg.Enabled then sg.Enabled = false end
+			end)
+		end)
+	end
+
+	UI.watch = function(tool)
+		if not HIDE.on or HIDE.watched[tool] then return end
+		HIDE.watched[tool] = true
+		pcall(function()
+			HIDE.conns[#HIDE.conns + 1] = tool.Equipped:Connect(function() HIDE.equipAt = os.clock() end)
+		end)
+	end
+
+	local function setHide(on)
+		if on == HIDE.on then return true end
+		HIDE.on, UI.hide = on, on
+		if on then
+			local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+			if pg then
+				for _, sg in ipairs(pg:GetChildren()) do
+					if sg:IsA("ScreenGui") and not OWN_GUI[sg.Name] and boomName(sg.Name) then hideGui(sg) end
+				end
+				pcall(function()
+					HIDE.conns[#HIDE.conns + 1] = pg.ChildAdded:Connect(function(sg)
+						if HIDE.on and sg:IsA("ScreenGui") and not OWN_GUI[sg.Name]
+							and (boomName(sg.Name) or os.clock() - HIDE.equipAt < 3) then
+							hideGui(sg)
+						end
+					end)
+				end)
+			end
+			local tool = findBoombox()
+			if tool then UI.watch(tool) end
+		else
+			for _, c in ipairs(HIDE.conns) do pcall(function() c:Disconnect() end) end
+			HIDE.conns = {}
+			HIDE.watched = setmetatable({}, { __mode = "k" })
+			for sg, wasOn in pairs(HIDE.list) do
+				if wasOn then pcall(function() sg.Enabled = true end) end
+			end
+			HIDE.list = {}
+		end
+		refresh()
+		return true
+	end
+
+	local function paint(btn, label, on)
+		btn.Text = label .. "\n" .. (on and "ON" or "OFF")
+		btn.BackgroundColor3 = on and Color3.fromRGB(46, 160, 90) or Color3.fromRGB(32, 34, 40)
+	end
+
+	refresh = function()
+		if flyBtn then paint(flyBtn, "FLY", FLY.on) end
+		if hideBtn then paint(hideBtn, "HIDE GUI", HIDE.on) end
+	end
+
+	local function makeButton(parent, name, x)
+		local b = Instance.new("TextButton")
+		b.Name = name
+		b.Size = UDim2.new(0, 74, 0, 50)
+		b.Position = UDim2.new(0, x, 0, 0)
+		b.BorderSizePixel = 0
+		b.AutoButtonColor = true
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.TextSize = 13
+		b.TextWrapped = true
+		pcall(function() b.Font = Enum.Font.GothamBold end)
+		pcall(function()
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, 10)
+			c.Parent = b
+		end)
+		b.Parent = parent
+		return b
+	end
+
+	pcall(function()
+		gui = Instance.new("ScreenGui")
+		gui.Name = "BoomboxToggles"
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 50
+		local holder = Instance.new("Frame")
+		holder.Name = "Holder"
+		holder.BackgroundTransparency = 1
+		holder.AnchorPoint = Vector2.new(1, 0.5)
+		holder.Position = UDim2.new(1, -10, 0.5, 0)
+		holder.Size = UDim2.new(0, 156, 0, 50)
+		holder.Parent = gui
+		flyBtn = makeButton(holder, "FlyButton", 0)
+		hideBtn = makeButton(holder, "HideGuiButton", 82)
+		flyBtn.Activated:Connect(function() setFly(not FLY.on) end)
+		hideBtn.Activated:Connect(function() setHide(not HIDE.on) end)
+		local hosts = {}
+		pcall(function()
+			if gethui then hosts[#hosts + 1] = gethui() end
+		end)
+		pcall(function() hosts[#hosts + 1] = game:GetService("CoreGui") end)
+		hosts[#hosts + 1] = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		local placed = false
+		for _, host in ipairs(hosts) do
+			if not placed then
+				pcall(function()
+					local old = host:FindFirstChild("BoomboxToggles")
+					if old then old:Destroy() end
+					gui.Parent = host
+				end)
+				if gui.Parent == host then placed = true end
+			end
+		end
+		if placed then
+			made[#made + 1] = gui
+			refresh()
+		else
+			gui = nil
+		end
+	end)
+
+	cleanupFns[#cleanupFns + 1] = function()
+		setFly(false)
+		setHide(false)
+		if gui then pcall(function() gui:Destroy() end) end
+	end
+end
+
 local ACCESS_FILE = "BoomboxAccess.json"
 local WL, BL, NAMES = {}, {}, {}
 
@@ -2055,6 +2384,7 @@ track(Players.PlayerAdded:Connect(hookPlayer))
 env.__BoomboxDispatch = function(text) dispatch(text, LocalPlayer) end
 env.__BoomboxCleanup = function()
 	gone = true
+	for _, f in ipairs(cleanupFns) do pcall(f) end
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	for _, cmd in ipairs(made) do pcall(function() cmd:Destroy() end) end
 	env.__BoomboxDispatch = nil
