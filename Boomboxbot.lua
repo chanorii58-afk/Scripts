@@ -27,6 +27,11 @@ local CONFIG = {
 	MaxAlbums = 10,
 	MaxTracks = 100,
 	MaxVolume = 10,
+	MaxQueue = 150,
+	MaxPerPlayer = 10,
+	SfxMax = 10,
+	ShortMax = 45,
+	LongMin = 300,
 }
 
 local NONE_MSG = "audio may have been removed/banned"
@@ -252,6 +257,45 @@ local function decode(body)
 	return ok and d or nil
 end
 
+local function metaScan(node, m, depth)
+	if type(node) ~= "table" or depth > 3 then return end
+	for k, v in pairs(node) do
+		if type(k) == "string" then
+			local lk = k:lower()
+			local tv = type(v)
+			if tv == "number" or tv == "string" then
+				if lk == "duration" or lk == "durationseconds" or lk == "durationinseconds" or lk == "audiolength" or lk == "timelength" or lk == "length" then
+					local n = tonumber(v)
+					if not n and tv == "string" then
+						local mm, ss = v:match("^(%d+):(%d%d)$")
+						if mm then n = tonumber(mm) * 60 + tonumber(ss) end
+					end
+					if n and n >= 100000 then n = n / 1000 end
+					if n and n > 0 and not m.dur then m.dur = n end
+				elseif lk == "durationms" or lk == "durationmilliseconds" then
+					local n = tonumber(v)
+					if n and n > 0 and not m.dur then m.dur = n / 1000 end
+				elseif tv == "string" and (lk == "audiotype" or lk == "audiosubtype" or lk == "subtype" or lk == "audiocategory" or lk == "category") then
+					local s = v:lower()
+					if s:find("effect", 1, true) or s:find("sfx", 1, true) then
+						m.sub = "sfx"
+					elseif s:find("music", 1, true) or s:find("song", 1, true) then
+						m.sub = "music"
+					end
+				end
+			elseif tv == "table" then
+				if lk == "tags" or lk == "genres" or lk == "genre" then
+					for _, x in pairs(v) do
+						local s = type(x) == "table" and (x.name or x.displayName or x.tag) or x
+						if type(s) == "string" and #(m.tags or "") < 160 then m.tags = (m.tags or "") .. " " .. s:lower() end
+					end
+				end
+				metaScan(v, m, depth + 1)
+			end
+		end
+	end
+end
+
 local function collect(node, out, depth)
 	if type(node) ~= "table" or depth > 7 then return end
 	local a = type(node.asset) == "table" and node.asset or node
@@ -262,7 +306,13 @@ local function collect(node, out, depth)
 		local author = ""
 		if type(cr) == "table" then author = tostring(cr.name or cr.Name or cr.username or "") end
 		if author == "" then author = tostring(node.creatorName or a.creatorName or node.creatorTargetName or "") end
-		out[#out + 1] = { id = id, name = clean(nm), author = clean(author) }
+		local item = { id = id, name = clean(nm), author = clean(author) }
+		local m = {}
+		metaScan(node, m, 0)
+		if m.dur then item.dur = m.dur end
+		if m.sub then item.sub = m.sub end
+		if m.tags then item.tags = m.tags end
+		out[#out + 1] = item
 		return
 	end
 	for _, v in pairs(node) do collect(v, out, depth + 1) end
@@ -278,10 +328,21 @@ local function collectIds(node, ids, depth)
 end
 
 local QC = {}
-local goodEp = nil
+local PLAT = { cur = "audio", custom = {}, down = false, downAt = 0, noted = false }
+local W = {}
+
+function PLAT.eff()
+	if PLAT.cur == "audio" and PLAT.down and os.clock() - PLAT.downAt > 120 then PLAT.down = false end
+	if PLAT.cur == "audio" and PLAT.down then return "catalog" end
+	return PLAT.cur
+end
+
+function PLAT.key(q)
+	return PLAT.eff() .. "|" .. q:lower()
+end
 
 local function qcache(q)
-	local key = q:lower()
+	local key = PLAT.key(q)
 	local c = QC[key]
 	if not c then
 		c = { pages = {}, P = nil, tokens = { [0] = "" } }
@@ -306,6 +367,196 @@ local function parseResponse(data)
 	end
 	return out
 end
+
+W.ID_PATS = { "library/(%d+)", "rbxassetid://(%d+)", "asset/?%?id=(%d+)", "data%-[%w%-]*id=[\"'](%d+)[\"']", "/audio/(%d+)", "/catalog/(%d+)", "assetid=(%d+)" }
+W.JUNK = { copy = true, copied = true, play = true, pause = true, stop = true, share = true, report = true, download = true,
+	view = true, preview = true, id = true, ["audio id"] = true, ["suggest tag +"] = true, ["suggest tag"] = true, more = true }
+
+function W.text(s)
+	s = tostring(s):gsub("&amp;", "&"):gsub("&#39;", "'"):gsub("&apos;", "'"):gsub("&quot;", '"'):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&nbsp;", " ")
+	return clean(s)
+end
+
+function W.good(tx)
+	if #tx < 2 or #tx > 80 then return false end
+	if not tx:find("%a") then return false end
+	local low = tx:lower()
+	if W.JUNK[low] or low:find("^listen") then return false end
+	return true
+end
+
+function W.extract(body)
+	body = tostring(body):gsub("<script.-</script>", " "):gsub("<style.-</style>", " "):gsub("<!%-%-.-%-%->", " ")
+	local toks = {}
+	local i, n = 1, #body
+	while i <= n do
+		local lt = body:find("<", i, true)
+		local stop = lt and (lt - 1) or n
+		if stop >= i then
+			local tx = W.text(body:sub(i, stop))
+			if tx ~= "" then
+				if tx:match("^%d+$") and #tx >= 6 and #tx <= 12 then
+					toks[#toks + 1] = { k = "idtext", v = tonumber(tx) }
+				else
+					toks[#toks + 1] = { k = "text", v = tx }
+				end
+			end
+		end
+		if not lt then break end
+		local gt = body:find(">", lt, true)
+		if not gt then break end
+		local tag = body:sub(lt, gt)
+		for _, pat in ipairs(W.ID_PATS) do
+			local id = tag:match(pat)
+			if id and #id >= 4 and #id <= 12 then
+				toks[#toks + 1] = { k = "idtag", v = tonumber(id) }
+				break
+			end
+		end
+		i = gt + 1
+	end
+	local idxs = {}
+	for p, tk in ipairs(toks) do
+		if tk.k ~= "text" then idxs[#idxs + 1] = p end
+	end
+	local out, seen = {}, {}
+	for n2, p in ipairs(idxs) do
+		local tk = toks[p]
+		if not seen[tk.v] and #out < 60 then
+			seen[tk.v] = true
+			local prev = idxs[n2 - 1] or 0
+			local nextp = idxs[n2 + 1] or (#toks + 1)
+			local before, after, dur = {}, {}, nil
+			for q = prev + 1, p - 1 do
+				local x = toks[q]
+				if x.k == "text" then
+					local mm, ss = x.v:match("^(%d+):(%d%d)$")
+					if mm then
+						dur = dur or (tonumber(mm) * 60 + tonumber(ss))
+					elseif W.good(x.v) then
+						before[#before + 1] = x.v
+					end
+				end
+			end
+			for q = p + 1, nextp - 1 do
+				local x = toks[q]
+				if x.k == "text" then
+					local mm, ss = x.v:match("^(%d+):(%d%d)$")
+					if mm then
+						if q <= p + 3 then dur = dur or (tonumber(mm) * 60 + tonumber(ss)) end
+					elseif W.good(x.v) and #after < 2 then
+						after[#after + 1] = x.v
+					end
+				end
+			end
+			local parts = {}
+			local nx = toks[p + 1]
+			if tk.k == "idtag" and nx and nx.k == "text" and W.good(nx.v) then
+				parts[1] = nx.v
+			else
+				for q = math.max(1, #before - 1), #before do parts[#parts + 1] = before[q] end
+				if #parts == 0 then
+					for q = 1, #after do parts[#parts + 1] = after[q] end
+				end
+			end
+			local item = { id = tk.v, name = table.concat(parts, " - "):sub(1, 90), author = "" }
+			if dur then item.dur = dur end
+			out[#out + 1] = item
+		end
+	end
+	return out
+end
+
+function W.parse(body)
+	local data = decode(body)
+	if data then return parseResponse(data) end
+	return W.extract(body)
+end
+
+function W.url(spec, q, k)
+	local url = spec.url
+	if not url:find("{q}", 1, true) then return nil end
+	local enc = HttpService:UrlEncode(q)
+	url = url:gsub("{q}", function() return enc end)
+	if url:find("{page}", 1, true) then
+		url = url:gsub("{page}", tostring(k + 1))
+	elseif k > 0 then
+		return false
+	end
+	return url
+end
+
+function W.fetch(spec, q, k)
+	local url = W.url(spec, q, k)
+	if url == nil then return nil end
+	if url == false then return {} end
+	local body = httpGet(url)
+	if not body then return nil end
+	return W.parse(body)
+end
+
+function W.count(items, word)
+	local n = 0
+	for _, it in ipairs(items) do
+		if (it.name .. " " .. it.author):lower():find(word, 1, true) then n = n + 1 end
+	end
+	return n
+end
+
+function W.discover(base)
+	local sep = base:find("?", 1, true) and "&" or "?"
+	local root = base:gsub("/+$", "")
+	local tpls = {}
+	for _, key in ipairs({ "search", "q", "query", "s", "keyword", "term", "text", "name", "title" }) do
+		tpls[#tpls + 1] = base .. sep .. key .. "={q}"
+	end
+	tpls[#tpls + 1] = root .. "/search/{q}"
+	tpls[#tpls + 1] = root .. "/search?q={q}"
+	tpls[#tpls + 1] = root .. "/search?query={q}"
+	local baseHits = 0
+	local body0 = httpGet(base)
+	if body0 then baseHits = W.count(W.parse(body0), "love") end
+	for _, tpl in ipairs(tpls) do
+		local url = tpl:gsub("{q}", "love")
+		local body = httpGet(url)
+		if body then
+			local items = W.parse(body)
+			local hits = W.count(items, "love")
+			if #items > 0 and hits >= 1 and (hits > baseHits or (hits >= 3 and hits * 2 >= #items)) then
+				return tpl, #items
+			end
+		end
+	end
+	return nil
+end
+
+PLAT.FILE = "BoomboxPlatform.json"
+
+function PLAT.save()
+	if not writefile then return end
+	local custom = {}
+	for name, spec in pairs(PLAT.custom) do custom[name] = { url = spec.url, title = spec.title } end
+	pcall(function() writefile(PLAT.FILE, HttpService:JSONEncode({ platform = PLAT.cur, custom = custom })) end)
+end
+
+function PLAT.load()
+	if not (isfile and readfile) then return end
+	pcall(function()
+		if not isfile(PLAT.FILE) then return end
+		local d = HttpService:JSONDecode(readfile(PLAT.FILE))
+		if type(d) ~= "table" then return end
+		if type(d.custom) == "table" then
+			for name, spec in pairs(d.custom) do
+				if type(name) == "string" and type(spec) == "table" and type(spec.url) == "string" then
+					PLAT.custom[name] = { url = spec.url, title = tostring(spec.title or name) }
+				end
+			end
+		end
+		local cur = d.platform
+		if cur == "audio" or cur == "catalog" or (type(cur) == "string" and PLAT.custom[cur]) then PLAT.cur = cur end
+	end)
+end
+PLAT.load()
 
 local function fetchEp(c, q, k, ep)
 	local enc = HttpService:UrlEncode(q)
@@ -339,19 +590,28 @@ local function fetchEp(c, q, k, ep)
 end
 
 local function fetchServerPage(c, q, k)
-	if goodEp then
-		local r = fetchEp(c, q, k, goodEp)
-		if r then return r end
-		return nil
-	end
-	for ep = 1, 2 do
-		local r = fetchEp(c, q, k, ep)
-		if r and #r > 0 then
-			goodEp = ep
-			return r
+	local p = PLAT.eff()
+	if p == "audio" then
+		local r = fetchEp(c, q, k, c.ep or 2)
+		if r == nil and k == 0 and c.P == nil and not c.ep then
+			local r1 = fetchEp(c, q, 0, 1)
+			if r1 then
+				c.ep = 1
+				PLAT.down, PLAT.downAt = true, os.clock()
+				if not PLAT.noted then
+					PLAT.noted = true
+					note("Roblox audio search didn't answer (" .. tostring(LASTERR or "no reply") .. "), so I'm using the Roblox catalog for now. I'll try audio search again in a couple of minutes.")
+				end
+				return r1
+			end
 		end
+		return r
+	elseif p == "catalog" then
+		return fetchEp(c, q, k, 1)
 	end
-	return nil
+	local spec = PLAT.custom[p]
+	if not spec then return nil end
+	return W.fetch(spec, q, k)
 end
 
 local function getItems(q, startIdx, count)
@@ -545,7 +805,132 @@ local function strictScore(c, qw, aw)
 	return sc, frac
 end
 
-local function strictFind(title, author, want)
+local K = { dur = {}, sfx = {}, long = {} }
+K.token = { sfx = "sfx", sfxs = "sfx", soundeffect = "sfx", soundeffects = "sfx", long = "long", song = "song", songs = "song", music = "song", short = "short" }
+K.name = { sfx = "sfx", song = "song", long = "long audio", short = "short audio" }
+K.sfxPool = { "explosion", "click", "whoosh", "punch", "laser", "door", "footsteps", "scream", "beep", "alarm", "water splash",
+	"glass break", "gunshot", "thunder", "coin", "jump", "bell", "pop", "siren", "oof" }
+K.longPool = { "1 hour", "mix", "extended", "ambience", "nonstop", "compilation", "full album", "10 hours" }
+for w in ("sfx sfxs fx soundfx"):gmatch("%S+") do K.sfx[w] = true end
+for w in ("hour hours hr hrs extended mix compilation nonstop marathon playlist ambience megamix"):gmatch("%S+") do K.long[w] = true end
+
+function K.has(c, set)
+	local low = ((c.name or "") .. " " .. (c.tags or "")):lower()
+	local _, words = wordsOf(low)
+	for w in pairs(words) do
+		if set[w] then return true end
+	end
+	if set == K.sfx and low:find("sound effect", 1, true) then return true end
+	if set == K.long and (low:find("full album", 1, true) or low:find("non stop", 1, true)) then return true end
+	return false
+end
+
+function K.of(c)
+	local d = K.dur[c.id] or c.dur
+	local sfxw = K.has(c, K.sfx)
+	if d and d > 0 then
+		if d <= CONFIG.SfxMax then return "sfx", d end
+		if d >= CONFIG.LongMin then return "long", d end
+		if c.sub == "sfx" or (sfxw and d < CONFIG.ShortMax) then return "sfx", d end
+		if d < CONFIG.ShortMax then return "short", d end
+		return "song", d
+	end
+	if c.sub == "sfx" then return "sfx" end
+	if c.sub == "music" then return "song" end
+	return nil
+end
+
+function K.match(c, want)
+	if not want then return "yes" end
+	local k = K.of(c)
+	if k then
+		if want == "short" then return (k == "short" or k == "sfx") and "yes" or "no" end
+		return (k == want) and "yes" or "no"
+	end
+	local sfxw = K.has(c, K.sfx)
+	if want == "sfx" then return sfxw and "yes" or "maybe" end
+	if want == "song" then
+		if sfxw then return "no" end
+		if K.has(c, K.long) then return "maybe" end
+		return "yes"
+	end
+	if want == "short" and sfxw then return "yes" end
+	return "maybe"
+end
+
+function K.fmt(d)
+	d = math.floor(d + 0.5)
+	if d >= 3600 then
+		return string.format("%d:%02d:%02d", math.floor(d / 3600), math.floor(d % 3600 / 60), d % 60)
+	end
+	return string.format("%d:%02d", math.floor(d / 60), d % 60)
+end
+
+function K.tag(c)
+	local k, d = K.of(c)
+	if not k then return "" end
+	return " [" .. k .. (d and (" " .. K.fmt(d)) or "") .. "]"
+end
+
+local ContentProvider = nil
+pcall(function() ContentProvider = game:GetService("ContentProvider") end)
+
+function K.probe(id)
+	if K.dur[id] then return K.dur[id] end
+	if not ContentProvider then return nil end
+	local len = nil
+	pcall(function()
+		local s = Instance.new("Sound")
+		s.SoundId = "rbxassetid://" .. id
+		s.Volume = 0
+		ContentProvider:PreloadAsync({ s })
+		len = tonumber(s.TimeLength)
+		pcall(function() s:Destroy() end)
+	end)
+	if len and len > 0 then
+		K.dur[id] = len
+		return len
+	end
+	return nil
+end
+
+function K.batch(items)
+	local pending = 0
+	for _, it in ipairs(items) do
+		if not K.dur[it.id] then
+			pending = pending + 1
+			task.spawn(function()
+				pcall(K.probe, it.id)
+				pending = pending - 1
+			end)
+		end
+	end
+	local t0 = os.clock()
+	while pending > 0 and os.clock() - t0 < 5 and not gone do task.wait(0.1) end
+end
+
+function K.split(text, allowSingle)
+	text = trim(text)
+	local words = {}
+	for w in text:gmatch("%S+") do words[#words + 1] = w end
+	local n = #words
+	local function tok(w) return (w:lower():gsub("[%[%]%(%)]", "")) end
+	if n >= 2 then
+		local two = tok(words[n - 1]) .. tok(words[n])
+		if K.token[two] and (n > 2 or allowSingle) then
+			return table.concat(words, " ", 1, n - 2), K.token[two]
+		end
+	end
+	if n >= 1 then
+		local k = K.token[tok(words[n])]
+		if k and (n > 1 or allowSingle) then
+			return table.concat(words, " ", 1, n - 1), k
+		end
+	end
+	return text, nil
+end
+
+local function strictFind(title, author, want, kind)
 	want = want or 3
 	local qw = wordsOf(title)
 	if #qw == 0 then return {} end
@@ -571,6 +956,13 @@ local function strictFind(title, author, want)
 	end)
 	for i = 1, math.min(2, #byLen) do addV(byLen[i]) end
 	if author ~= "" then addV(author) end
+	if kind == "sfx" or kind == "short" then
+		addV(title .. " sfx")
+		addV(title .. " sound effect")
+	elseif kind == "long" then
+		addV(title .. " extended")
+		addV(title .. " 1 hour")
+	end
 
 	local found, order = {}, {}
 	local authorHit = false
@@ -581,15 +973,18 @@ local function strictFind(title, author, want)
 			if #got == 0 then break end
 			for _, e in ipairs(got) do
 				local sc, frac = strictScore(e.item, qw, aw)
-				if sc then
+				local m = sc and K.match(e.item, kind) or "no"
+				if sc and m ~= "no" then
 					if frac >= 0.99 then authorHit = true end
 					sc = sc + 0.1 * math.max(0, 1 - e.idx / 400)
 					local prev = found[e.item.id]
 					if not prev then
-						found[e.item.id] = { c = e.item, sc = sc }
+						found[e.item.id] = { c = e.item, sc = sc, m = m }
 						order[#order + 1] = e.item.id
-						if sc >= 95 then exact = exact + 1 end
-						if sc >= 75 then strong = strong + 1 end
+						if m == "yes" then
+							if sc >= 95 then exact = exact + 1 end
+							if sc >= 75 then strong = strong + 1 end
+						end
 					elseif sc > prev.sc then
 						prev.sc = sc
 					end
@@ -604,24 +999,53 @@ local function strictFind(title, author, want)
 
 	local arr = {}
 	for _, id in ipairs(order) do arr[#arr + 1] = found[id] end
-	table.sort(arr, function(a, b)
-		if a.sc ~= b.sc then return a.sc > b.sc end
-		return a.c.id < b.c.id
-	end)
+	local function sortArr()
+		table.sort(arr, function(a, b)
+			local ra, rb = a.sc + (a.m == "yes" and 5 or 0), b.sc + (b.m == "yes" and 5 or 0)
+			if ra ~= rb then return ra > rb end
+			return a.c.id < b.c.id
+		end)
+	end
+	sortArr()
+	if kind then
+		local need = {}
+		for i = 1, math.min(#arr, 8) do
+			if arr[i].m == "maybe" then need[#need + 1] = arr[i].c end
+		end
+		if #need > 0 then
+			K.batch(need)
+			local keep = {}
+			for _, a in ipairs(arr) do
+				a.m = K.match(a.c, kind)
+				if a.m ~= "no" then keep[#keep + 1] = a end
+			end
+			arr = keep
+			sortArr()
+		end
+	end
 	local out = {}
 	for i = 1, math.min(want, #arr) do out[i] = arr[i].c end
-	return out
+	return out, arr[1] and arr[1].sc or nil
 end
 
-local function findAudio(title, author, want)
-	local res = strictFind(title, author, want or 3)
-	if #res > 0 or CONFIG.Strict then return res end
-	return looseFind(title, author, want)
+local function findAudio(title, author, want, kind)
+	local res, top = strictFind(title, author, want or 3, kind)
+	if #res > 0 or CONFIG.Strict then return res, top end
+	local loose = looseFind(title, author, kind and 9 or want)
+	if kind then
+		local keep = {}
+		for _, c in ipairs(loose) do
+			if K.match(c, kind) ~= "no" and #keep < (want or 3) then keep[#keep + 1] = c end
+		end
+		loose = keep
+		if #loose == 0 then loose = looseFind(title, author, want) end
+	end
+	return loose
 end
 
 local SL = {}
 local function strictList(query, need)
-	local key = query:lower()
+	local key = PLAT.key(query)
 	local s = SL[key]
 	if not s then
 		local title, author = splitTitleAuthor(query)
@@ -706,13 +1130,68 @@ end
 local function randomFor(keyword)
 	local first = getItems(keyword, 0, 1)
 	if #first == 0 then return nil end
-	local c = QC[keyword:lower()]
+	local c = QC[PLAT.key(keyword)]
 	local P = c and c.P or CONFIG.PerPage
-	local maxPage = (goodEp == 2) and 5 or 20
+	local eff = PLAT.eff()
+	local maxPage = (eff == "audio") and 5 or ((eff == "catalog") and 20 or 0)
 	local g = math.random(0, maxPage) * P + math.random(0, P - 1)
 	local got = getItems(keyword, g, 1)
 	if #got == 0 then got = getItems(keyword, math.random(0, P - 1), 1) end
 	return (got[1] and got[1].item) or first[1].item
+end
+
+function K.random(keyword, kind)
+	local queries = {}
+	if keyword then
+		if kind == "long" then
+			queries = { keyword .. " mix", keyword .. " 1 hour", keyword .. " extended", keyword }
+		elseif kind == "sfx" or kind == "short" then
+			queries = { keyword .. " sfx", keyword }
+		else
+			queries = { keyword }
+		end
+	else
+		local src = GENRES
+		if kind == "sfx" or kind == "short" then
+			src = K.sfxPool
+		elseif kind == "long" then
+			src = K.longPool
+		end
+		for i, g in ipairs(src) do queries[i] = g end
+		for i = #queries, 2, -1 do
+			local j = math.random(i)
+			queries[i], queries[j] = queries[j], queries[i]
+		end
+	end
+	local got, seen, tries, qi = {}, {}, 0, 0
+	local goal = kind and 6 or 3
+	while #got < goal and tries < 10 and not gone do
+		tries = tries + 1
+		qi = qi % #queries + 1
+		local c = randomFor(queries[qi])
+		if c and not seen[c.id] then
+			seen[c.id] = true
+			if K.match(c, kind) ~= "no" then got[#got + 1] = c end
+		end
+	end
+	local maybes = {}
+	for _, c in ipairs(got) do
+		if K.match(c, kind) == "maybe" then maybes[#maybes + 1] = c end
+	end
+	if #maybes > 0 then K.batch(maybes) end
+	local yes, rest = {}, {}
+	for _, c in ipairs(got) do
+		local m = K.match(c, kind)
+		if m == "yes" then
+			yes[#yes + 1] = c
+		elseif m == "maybe" then
+			rest[#rest + 1] = c
+		end
+	end
+	for _, c in ipairs(rest) do yes[#yes + 1] = c end
+	local out = {}
+	for i = 1, math.min(3, #yes) do out[i] = yes[i] end
+	return out
 end
 
 local function getChar() return LocalPlayer.Character end
@@ -749,7 +1228,7 @@ local function equipTool(tool)
 	return true
 end
 
-local SC = { map = {}, n = 0, deep = {} }
+local SC = { map = {}, n = 0, deep = {}, homes = {} }
 local SoundService = nil
 pcall(function() SoundService = game:GetService("SoundService") end)
 
@@ -802,6 +1281,33 @@ local function deepFind(needle)
 	return nil
 end
 
+local function homeScan(needle)
+	for _, home in ipairs(SC.homes) do
+		if home == Workspace or home.Parent then
+			local ok, kids = pcall(function() return home:GetChildren() end)
+			if ok then
+				for _, d in ipairs(kids) do
+					local isMatch = false
+					pcall(function() isMatch = d:IsA("Sound") and soundMatches(d, needle) end)
+					if isMatch then return d end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function rememberHome(snd)
+	local par = nil
+	pcall(function() par = snd.Parent end)
+	if not par then return end
+	for _, h in ipairs(SC.homes) do
+		if h == par then return end
+	end
+	if #SC.homes >= 4 then table.remove(SC.homes, 1) end
+	SC.homes[#SC.homes + 1] = par
+end
+
 local function findSound(id, tool, deep)
 	local needle = tostring(id)
 	local cached = SC.map[needle]
@@ -814,8 +1320,10 @@ local function findSound(id, tool, deep)
 	for _, root in ipairs({ tool or false, getChar() or false }) do
 		if root and not found then found = scanRoot(root, needle) end
 	end
+	if not found then found = homeScan(needle) end
 	if not found and deep then found = deepFind(needle) end
 	if found then
+		rememberHome(found)
 		if SC.n >= 30 then SC.map, SC.n = {}, 0 end
 		SC.map[needle] = found
 		SC.n = SC.n + 1
@@ -945,6 +1453,7 @@ local function playAudio(tool, c, quick)
 		if i ~= goodForm then order[#order + 1] = i end
 	end
 	local deepTried = false
+	SC.deep[tostring(id)] = nil
 	for n, i in ipairs(order) do
 		if quick and n > 2 then break end
 		local sent = forms[i]()
@@ -987,17 +1496,22 @@ local function label(c)
 end
 
 local CMD_LINES = {
-	"Boombox commands (1/5): /play <title> [author] - plays it (exact match) | /play <audio id> | /play random [genre] | /play pick <number> | /play stop",
-	"Boombox commands (2/5): /audio search <words> [page 1-1000] | /audio next | /audio prev | /audio id <number> | /audio grab id <title> [author]",
-	"Boombox commands (3/5): /album create <name> | /album load <name> | /album add <audio> <album> | /album delete <name> | /album audio remove <audio> <album>",
-	"Boombox commands (4/5): /volume <0-10> | /album list [name] | /album skip | /album stop | /audio help [command] | /cmds",
-	"Boombox commands (5/5): owner only: /whitelist <player> | /blacklist <player> | /audio access everyone|friends|me | /audio strict on|off",
+	"Boombox commands (1/6): /play <title> [author] [sfx|long|song] | /play <audio id> | /play random [genre] [sfx|long|song] | /play pick <number> | /play stop",
+	"Boombox commands (2/6): /skip | /queue | /queue remove <number|title|last> | /queue clear | /volume <0-10>",
+	"Boombox commands (3/6): /audio search <words> [page 1-1000] | /audio next | /audio prev | /audio id <number> | /audio grab id <title> [author]",
+	"Boombox commands (4/6): /album create <name> | /album load <name> | /album add <audio> <album> | /album delete <name> | /album audio remove <audio> <album>",
+	"Boombox commands (5/6): /search platform [name] | /search platform add <name> <url> | /album list [name] | /album skip | /album stop",
+	"Boombox commands (6/6): /audio help [command] | /cmds | owner only: /whitelist <player> | /blacklist <player> | /audio access everyone|friends|me | /audio strict on|off",
 }
 local HELP = {
-	play = "/play <title> [author] - plays that audio (author optional: /play sweden by c418). Strict search: only audios that contain your words. /play <audio id> plays that exact id.",
-	random = "/play random - plays a random catalog audio. /play random <genre> - random audio of that genre (rock, lofi, jazz...). If the genre doesn't exist I list them all.",
-	pick = "/play pick <number> - plays that number from your last /audio search.",
-	stop = "/play stop - stops the boombox.",
+	play = "/play <title> [author] [sfx|long|song] - queues that audio (exact match). The type word is optional and narrows the search. /play <audio id> queues that exact id.",
+	random = "/play random [genre] [sfx|long|song] - queues a random audio. Genre is optional (rock, lofi, jazz...). With sfx or long any word works: /play random explosion sfx.",
+	pick = "/play pick <number> - queues that number from your last /audio search.",
+	stop = "/play stop - stops the boombox and clears the whole queue.",
+	skip = "/skip - skips the audio that is playing and plays the next one in the queue. If the queue is empty it stops the boombox.",
+	queue = "/queue - shows what is queued. /queue remove <number|title|last> takes one out (yours; the owner can remove any). /queue clear removes all of yours.",
+	types = "sfx = sound effects (about 10 s or less), short = under 45 s, song = normal music, long = 5 min or more. Put one last: /play explosion sfx. I check the real length when it plays.",
+	platform = "/search platform [name] - shows or changes where I search: audio (Roblox audio search, the default), catalog, or a site added with /search platform add <name> <url with {q}>. Saved. Owner only.",
 	search = "/audio search <words> - lists up to 10 audios in chat. /audio search <page 1-1000> shows another page of the same search. /audio next and /audio prev flip pages.",
 	id = "/audio id <number> - sends the audio id for that number from your last /audio search (it is also copied to your clipboard).",
 	grab = "/audio grab id <title> [author] - sends the id of that audio, or 'audio may have been removed/banned' if there is no exact match.",
@@ -1009,19 +1523,21 @@ local HELP = {
 	strict = "/audio strict on|off - on (default): only audios that really contain the words you typed. off: if nothing matches I play the closest audio. Owner only.",
 	album = "/album create <name> | load <name> | add <audio> <album> | delete <name> | audio remove <audio> <album> | list [name] | skip | stop. Albums are personal: only their creator can use them.",
 	create = "/album create <name> - makes your own album (up to 10, name up to 24 characters). Only you can use it. Example: /album create chill",
-	load = "/album load <name> - plays every audio of your album in order, one after another. /album skip jumps to the next one and /album stop ends it.",
+	load = "/album load <name> - queues every audio of your album in order. /album skip jumps to the next one and /album stop removes the album from the queue.",
 	add = "/album add <audio> <album> - adds an audio to your album. <audio> = title [author], an audio id, a number from /audio search, or now. Example: /album add sweden c418 chill",
 	delete = "/album delete <name> - deletes your album and everything in it.",
 	remove = "/album audio remove <audio> <album> - removes one audio from your album. <audio> = its number in /album list, its id or part of its title.",
 	list = "/album list - shows your albums. /album list <name> [page] - shows the audios in that album with their numbers.",
-	skip = "/album skip - jumps to the next audio of the album that is playing. /album stop - stops the album. Only who loaded it or the owner.",
+	albumskip = "/album skip - jumps to the next audio of the album that is playing. /album stop - removes the album from the queue. Only who loaded it or the owner.",
 	help = "/audio help [command] - explains a command, for example /audio help search. Without a command it lists them all.",
 }
 local HELP_ALIAS = { next = "search", prev = "search", previous = "search", page = "search", commands = "cmds",
 	genre = "random", genres = "random", audio = "search", boombox = "play", ["audio id"] = "id",
 	allow = "whitelist", block = "blacklist", ban = "blacklist", wl = "whitelist", bl = "blacklist",
-	albums = "album", playlist = "album", playlists = "album", exact = "strict", vol = "volume", loud = "volume", loudness = "volume" }
-local ALBUM_SUB = { stop = "skip", new = "create", make = "create", del = "delete", destroy = "delete", rm = "remove",
+	albums = "album", playlist = "album", playlists = "album", exact = "strict", vol = "volume", loud = "volume", loudness = "volume",
+	q = "queue", queued = "queue", sfx = "types", long = "types", song = "types", short = "types", type = "types", kind = "types",
+	platforms = "platform", source = "platform", site = "platform", sites = "platform" }
+local ALBUM_SUB = { stop = "albumskip", skip = "albumskip", new = "create", make = "create", del = "delete", destroy = "delete", rm = "remove",
 	audio = "remove", show = "list", view = "list", play = "load" }
 
 local function showCmds()
@@ -1036,6 +1552,7 @@ local function showHelp(name)
 	end
 	local first, second = name:match("^(%S+)%s*(%S*)")
 	name = first or ""
+	if name == "search" and second == "platform" then name = "platform" end
 	if name == "album" and second ~= "" then
 		name = ALBUM_SUB[second] or second
 		if not HELP[name] then name = "album" end
@@ -1049,6 +1566,7 @@ local function showHelp(name)
 end
 
 local playGen = 0
+local Q = { items = {}, cur = nil, running = false, skip = false, endNote = nil }
 local LASTS = {}
 local function lastOf(uid)
 	local l = LASTS[uid]
@@ -1078,14 +1596,13 @@ local function playFirstThatWorks(tool, cands, gen, quickAll)
 end
 
 local NOW = nil
-local function announce(c, who)
-	NOW = c
-	local by = (who and who ~= LocalPlayer) and (" - requested by " .. tostring(who.DisplayName):sub(1, 20)) or ""
-	sendChat("Now playing: " .. label(c) .. " (" .. c.id .. ")" .. by)
-end
 
-local function noneFound(strictNote)
-	sendChat(NONE_MSG)
+local function noneFound(strictNote, kind)
+	if kind then
+		sendChat("No " .. K.name[kind] .. " matched that - try it without '" .. kind .. "'.")
+	else
+		sendChat(NONE_MSG)
+	end
 	if strictNote and CONFIG.Strict then
 		note("Strict search found no exact match. /audio strict off lets me play the closest audio instead.")
 	end
@@ -1098,23 +1615,21 @@ local function doPlay(rest, who)
 	rest = trim(rest)
 	local low = rest:lower()
 	if rest == "" then
-		hint(who, "/play <title> [author]  |  /play random [genre]  |  /play pick <number>  |  /play stop  |  /cmds")
+		hint(who, "/play <title> [author] [sfx|long|song]  |  /play random [genre] [sfx|long|song]  |  /play pick <number>  |  /play stop  |  /skip  |  /queue  |  /cmds")
 		return
 	end
 	if low == "stop" then
-		playGen = playGen + 1
-		stopBoombox()
+		Q.stop()
 		return
 	end
-	playGen = playGen + 1
-	local gen = playGen
+	local gen0 = playGen
 	local tool = findBoombox()
 	if not tool then
 		sendChat("I need boombox.")
 		return
 	end
 	LASTERR = nil
-	local cands = {}
+	local cands, kind = {}, nil
 
 	local pick = low:match("^pick%s+(%d+)$")
 	local small = rest:match("^(%d%d?%d?%d?)$")
@@ -1130,49 +1645,47 @@ local function doPlay(rest, who)
 	elseif direct then
 		cands = { { id = tonumber(direct), name = "audio " .. direct, author = "" } }
 	elseif low == "random" or low:match("^random%s") then
-		local genreText = trim(low:sub(7))
-		if genreText == "" then
-
-			local pool = {}
-			for i, g in ipairs(GENRES) do pool[i] = g end
-			for _ = 1, 8 do
-				if #cands >= 3 or #pool == 0 then break end
-				local c = randomFor(table.remove(pool, math.random(#pool)))
-				if c then cands[#cands + 1] = c end
-			end
-		else
-			local keyword = resolveGenre(genreText)
+		local gtext
+		gtext, kind = K.split(trim(low:sub(7)), true)
+		local keyword = nil
+		if gtext ~= "" then
+			keyword = resolveGenre(gtext)
 			if not keyword then
-				sendChat("genre doesn't exist!")
-				sendList("Genres:", GENRES, ", ")
+				if kind == "sfx" or kind == "long" or kind == "short" then
+					keyword = gtext
+				else
+					sendChat("genre doesn't exist!")
+					sendList("Genres:", GENRES, ", ")
+					return
+				end
+			end
+		end
+		cands = K.random(keyword, kind)
+		if #cands == 0 then
+			noneFound(false, kind)
+			return
+		end
+	else
+		local body, k = K.split(rest, false)
+		local title, author = splitTitleAuthor(body)
+		kind = k
+		if kind then
+			local wt, wa = splitTitleAuthor(rest)
+			local whole, top = strictFind(wt, wa, 3)
+			if #whole > 0 and top and top >= 95 then
+				cands, kind = whole, nil
+			end
+		end
+		if #cands == 0 then
+			cands = findAudio(title, author, 3, kind)
+			if #cands == 0 then
+				noneFound(true, kind)
 				return
 			end
-			for _ = 1, 3 do
-				local c = randomFor(keyword)
-				if c then cands[#cands + 1] = c end
-			end
-		end
-		if #cands == 0 then
-			noneFound()
-			return
-		end
-	else
-		local title, author = splitTitleAuthor(rest)
-		cands = findAudio(title, author, 3)
-		if #cands == 0 then
-			noneFound(true)
-			return
 		end
 	end
-	if gen ~= playGen then return end
-	local c = playFirstThatWorks(tool, cands, gen)
-	if gen ~= playGen then return end
-	if c then
-		announce(c, who)
-	else
-		sendChat("That audio didn't play - it may have been removed/banned.")
-		problem("Tried " .. #cands .. " audio(s) but none started on your boombox. Some boomboxes use a different control and can't be driven by a script.")
-	end
+	if gen0 ~= playGen then return end
+	Q.add({ cands = cands, who = who, kind = kind })
 end
 
 local function copyId(id, who)
@@ -1270,7 +1783,7 @@ local function doAudio(rest, who)
 		local item = L.byIdx[n]
 		if not item and L.query and not L.strict then
 			getItems(L.query, math.floor((n - 1) / CONFIG.PerPage) * CONFIG.PerPage, CONFIG.PerPage)
-			local c = QC[L.query:lower()]
+			local c = QC[PLAT.key(L.query)]
 			if c and c.P then
 				local k = math.floor((n - 1) / c.P)
 				local pg = c.pages[k]
@@ -1327,6 +1840,184 @@ local function doAudio(rest, who)
 
 	else
 		hint(who, "Unknown /audio command. Type /cmds to see them all.")
+	end
+end
+
+PLAT.ALIAS = { roblox = "audio", ["roblox audio"] = "audio", ["audio search"] = "audio", ["roblox audio search"] = "audio",
+	creator = "audio", ["creator store"] = "audio", store = "audio", toolbox = "audio", search = "audio",
+	["roblox catalog"] = "catalog", marketplace = "catalog", library = "catalog", ["roblox library"] = "catalog",
+	den = "robloxden", ["roblox den"] = "robloxden", ["roblox music codes"] = "robloxden", ["music codes"] = "robloxden" }
+PLAT.PRESET = { robloxden = "https://robloxden.com/music-codes" }
+
+function PLAT.label(name)
+	if name == "audio" then return "Roblox audio search" end
+	if name == "catalog" then return "Roblox catalog" end
+	local spec = PLAT.custom[name]
+	return spec and spec.title or name
+end
+
+function PLAT.names()
+	local out = { "audio", "catalog" }
+	local extra = {}
+	for n in pairs(PLAT.custom) do extra[#extra + 1] = n end
+	for n in pairs(PLAT.PRESET) do
+		if not PLAT.custom[n] then extra[#extra + 1] = n end
+	end
+	table.sort(extra)
+	for _, n in ipairs(extra) do out[#out + 1] = n end
+	return out
+end
+
+function PLAT.show()
+	local names = {}
+	for _, n in ipairs(PLAT.names()) do names[#names + 1] = (n == PLAT.cur) and ("[" .. n .. "]") or n end
+	local now = PLAT.label(PLAT.cur) .. " (" .. PLAT.cur .. ")"
+	if PLAT.cur == "audio" and PLAT.eff() == "catalog" then now = now .. " - using the catalog for a moment" end
+	sendChat("Search platform: " .. now .. ". It is saved, so it stays after you rejoin.")
+	sendList("Platforms:", names, ", ")
+	sendChat("Change it with /search platform <name>. Add a site with /search platform add <name> <url> (put {q} where the search words go).")
+end
+
+function PLAT.use(name)
+	PLAT.cur = name
+	PLAT.down, PLAT.noted = false, false
+	PLAT.save()
+	sendChat("Search platform is now " .. PLAT.label(name) .. ". Saved - it stays after you rejoin or run the script again.")
+end
+
+function PLAT.test()
+	LASTERR = nil
+	local got = getItems("love", 0, 1)
+	if #got == 0 then
+		sendChat("Heads up: a test search on " .. PLAT.label(PLAT.cur) .. " found nothing, so it may be down or block scripts. /search platform audio goes back.")
+		return false
+	end
+	return true
+end
+
+function PLAT.choose(arg)
+	local key = clean(arg):lower()
+	local name = key
+	if not PLAT.custom[key] then name = PLAT.ALIAS[key] or key end
+	if name == "audio" or name == "catalog" or PLAT.custom[name] then
+		PLAT.use(name)
+		if name ~= "audio" and name ~= "catalog" then PLAT.test() end
+		return
+	end
+	local base = PLAT.PRESET[name]
+	if base then
+		sendChat("Checking how to search " .. name .. " (this takes a few seconds)...")
+		local tpl = W.discover(base)
+		if tpl then
+			PLAT.custom[name] = { url = tpl, title = name }
+			PLAT.use(name)
+			PLAT.test()
+		else
+			sendChat("I couldn't find a search address for " .. name .. " - its search may run inside the web page, which scripts can't use. If you know its search link: /search platform add " .. name .. " <url with {q}>")
+		end
+		return
+	end
+	local hits = {}
+	if #key >= 2 then
+		for _, n in ipairs(PLAT.names()) do
+			if n:sub(1, #key) == key then hits[#hits + 1] = n end
+		end
+	end
+	if #hits == 1 then
+		PLAT.choose(hits[1])
+		return
+	end
+	sendChat("I don't know a platform called " .. key:sub(1, 24) .. ".")
+	sendList("Platforms:", PLAT.names(), ", ")
+end
+
+function PLAT.add(arg)
+	local name, url = arg:match("^(%S+)%s+(%S+)$")
+	if not name then
+		sendChat("Use /search platform add <name> <url>. Put {q} where the search words go, like <site>/search?q={q}. Without {q} I try to find the search myself.")
+		return
+	end
+	name = name:lower()
+	if not name:match("^[%w%-_]+$") or #name < 2 or #name > 20 then
+		sendChat("Platform names are 2-20 letters, numbers or dashes.")
+		return
+	end
+	local aliasOf = PLAT.ALIAS[name]
+	if name == "audio" or name == "catalog" or (aliasOf and aliasOf ~= "robloxden") then
+		sendChat("That name is taken - pick another one.")
+		return
+	end
+	url = url:gsub("{query}", "{q}"):gsub("{search}", "{q}"):gsub("{term}", "{q}"):gsub("%%s", "{q}")
+	if not url:match("^https?://[%w%-%.]+") then
+		sendChat("The address has to start with http:// or https://")
+		return
+	end
+	local host = url:match("^https?://([^/%?]+)") or name
+	if not url:find("{q}", 1, true) then
+		sendChat("Checking how to search " .. host .. " (a few seconds)...")
+		local tpl = W.discover(url)
+		if not tpl then
+			sendChat("I couldn't find a search on that page. Give me the full search link with {q} where the words go.")
+			return
+		end
+		url = tpl
+	end
+	PLAT.custom[name] = { url = url, title = name }
+	PLAT.use(name)
+	PLAT.test()
+end
+
+function PLAT.remove(arg)
+	local name = clean(arg):lower()
+	if name == "audio" or name == "catalog" then
+		sendChat("The built-in platforms can't be removed.")
+		return
+	end
+	if not PLAT.custom[name] then
+		sendChat("There's no added platform called " .. name:sub(1, 20) .. ".")
+		return
+	end
+	PLAT.custom[name] = nil
+	if PLAT.cur == name then
+		PLAT.use("audio")
+	else
+		PLAT.save()
+	end
+	sendChat("Removed the platform " .. name .. ".")
+end
+
+function PLAT.cmd(rest, who)
+	who = who or LocalPlayer
+	rest = trim(rest)
+	local sub, arg = rest:match("^(%a+)%s*(.*)$")
+	sub = sub and sub:lower() or ""
+	arg = trim(arg or "")
+	if sub ~= "platform" and sub ~= "source" and sub ~= "site" and sub ~= "engine" then
+		if rest == "" then
+			hint(who, "/search <words>   |   /search platform [name]")
+			return
+		end
+		doAudio("search " .. rest, who)
+		return
+	end
+	local s2, a2 = arg:match("^(%a+)%s*(.*)$")
+	s2 = s2 and s2:lower() or ""
+	a2 = trim(a2 or "")
+	if arg == "" or s2 == "list" or s2 == "show" or s2 == "current" then
+		PLAT.show()
+		return
+	end
+	if who ~= LocalPlayer then
+		sendChat("Only the boombox owner can change the search platform. Now: " .. PLAT.label(PLAT.cur) .. ".")
+		return
+	end
+	LASTERR = nil
+	if s2 == "add" then
+		PLAT.add(a2)
+	elseif s2 == "remove" or s2 == "delete" or s2 == "del" or s2 == "rm" then
+		PLAT.remove(a2)
+	else
+		PLAT.choose(arg)
 	end
 end
 
@@ -1652,8 +2343,6 @@ local function albumAdd(who, arg)
 	sendChat("Added " .. label(c) .. " (" .. c.id .. ") to " .. dn(who) .. "'s album " .. al.name .. " as track " .. #al.tracks .. ".")
 end
 
-local PL = nil
-
 local function albumDelete(who, arg)
 	local name = cleanName(arg)
 	if name == "" then
@@ -1667,11 +2356,7 @@ local function albumDelete(who, arg)
 	end
 	table.remove(myAlbums(who.UserId), i)
 	saveAlbums()
-	if PL and PL.album == al and PL.gen == playGen then
-		playGen = playGen + 1
-		PL = nil
-		stopBoombox()
-	end
+	Q.dropAlbum(al)
 	sendChat("Deleted the album " .. al.name .. " (" .. #al.tracks .. " audio" .. (#al.tracks == 1 and "" or "s") .. ").")
 end
 
@@ -1795,25 +2480,335 @@ local function albumList(who, arg)
 	listAlbum(who, al, page)
 end
 
-local function waitTrackEnd(tool, c, gen, st)
-	local started, lastPos, misses = os.clock(), -1, 0
-	while gen == playGen and not gone do
-		task.wait(1)
-		if gen ~= playGen or gone then return true end
-		if st.skip then return true end
+function Q.measure(tool, c)
+	for n = 1, 3 do
 		local snd = findSound(c.id, tool)
+		local len = snd and tonumber(snd.TimeLength) or 0
+		if len > 0 then
+			K.dur[c.id] = len
+			return len
+		end
+		if n < 3 then task.wait(0.4) end
+	end
+	return nil
+end
+
+function Q.wait(tool, c, gen)
+	local started, lastPos, lastLen, misses, cap = os.clock(), -1, 0, 0, 1500
+	while gen == playGen and not gone do
+		task.wait(0.5)
+		if gen ~= playGen or gone then return true end
+		if Q.skip then return true end
+		if tool.Parent ~= getChar() then return false end
+		local snd = findSound(c.id, tool, misses >= 2)
 		if snd then
 			misses = 0
 			local pos = tonumber(snd.TimePosition) or 0
+			local len = tonumber(snd.TimeLength) or 0
+			if len > 0 then
+				K.dur[c.id] = K.dur[c.id] or len
+				cap = math.max(cap, len * 1.5 + 60)
+				lastLen = len
+				if pos >= len - 0.3 then return true end
+			end
 			if pos < lastPos - 1 then return true end
 			lastPos = pos
 		else
 			misses = misses + 1
-			if misses >= 3 then return tool.Parent == getChar() end
+			if lastLen > 0 and lastPos >= lastLen - 1.2 then return true end
+			if misses >= 3 then return true end
 		end
-		if os.clock() - started > 1500 then return true end
+		if os.clock() - started > cap then return true end
 	end
 	return true
+end
+
+function Q.doneAlbum(e)
+	if e.album and e.i == e.n then
+		sendChat("Album " .. e.album.name .. " finished (" .. e.run.played .. " played" .. (e.run.failed > 0 and (", " .. e.run.failed .. " skipped") or "") .. ").")
+	end
+end
+
+function Q.play(e, gen)
+	local tool = findBoombox()
+	if not tool then
+		sendChat("I need boombox.")
+		Q.items = {}
+		return false
+	end
+	local started, mismatch = nil, nil
+	for i, c in ipairs(e.cands) do
+		if gen ~= playGen or gone then return false end
+		local ok = playFirstThatWorks(tool, { c }, gen, goodForm ~= nil or i > 1)
+		if gen ~= playGen or gone then return false end
+		if ok then
+			Q.measure(tool, c)
+			if e.kind and K.match(c, e.kind) == "no" then
+				mismatch = c
+			else
+				started = c
+				break
+			end
+		end
+	end
+	if not started then
+		if e.album then
+			sendChat("Skipping " .. label(e.cands[1]) .. " - it couldn't play (removed/banned?).")
+			e.run.failed = e.run.failed + 1
+		elseif mismatch then
+			sendChat(label(mismatch) .. K.tag(mismatch) .. " isn't a " .. K.name[e.kind] .. ", so I skipped it.")
+		else
+			sendChat("That audio didn't play - it may have been removed/banned.")
+			problem("Tried " .. #e.cands .. " audio(s) but none started on your boombox. Some boomboxes use a different control and can't be driven by a script.")
+		end
+		Q.doneAlbum(e)
+		return false
+	end
+	e.now = started
+	NOW = started
+	if e.album then
+		e.run.played = e.run.played + 1
+		sendChat("Now playing (" .. e.i .. "/" .. e.n .. "): " .. label(started) .. " (" .. started.id .. ")" .. K.tag(started) .. " - " .. dn(e.who) .. "'s album " .. e.album.name)
+	else
+		local by = (e.who and e.who ~= LocalPlayer) and (" - requested by " .. dn(e.who)) or ""
+		sendChat("Now playing: " .. label(started) .. " (" .. started.id .. ")" .. K.tag(started) .. by)
+	end
+	local more = Q.wait(tool, started, gen)
+	if gen ~= playGen or gone then return true end
+	if not more then
+		Q.items = {}
+		sendChat("The queue stopped (the boombox was put away).")
+	end
+	Q.doneAlbum(e)
+	return true
+end
+
+function Q.finish(played, last)
+	local tool = findBoombox()
+	if tool and NOW then
+		local snd = findSound(NOW.id, tool)
+		if snd then
+			fireAll(tool, "Stop")
+			fireAll(tool, "StopSong")
+		end
+	end
+	local note2 = Q.endNote
+	Q.endNote = nil
+	if note2 then
+		sendChat(note2)
+	elseif note2 == nil and played >= 2 and not (last and last.album) then
+		sendChat("The queue is finished (" .. played .. " played).")
+	end
+end
+
+function Q.loop(gen)
+	local played, last = 0, nil
+	local ok, err = pcall(function()
+		while gen == playGen and not gone do
+			local e = table.remove(Q.items, 1)
+			if not e then break end
+			last = e
+			Q.cur = e
+			Q.skip = false
+			if Q.play(e, gen) then played = played + 1 end
+		end
+	end)
+	if gen == playGen then
+		Q.running = false
+		Q.cur = nil
+		Q.finish(played, last)
+		if not ok and #Q.items > 0 and not gone then
+			Q.running = true
+			task.spawn(function() Q.loop(gen) end)
+		end
+	end
+	if not ok then problem("Boombox script error: " .. tostring(err):sub(1, 150)) end
+end
+
+function Q.add(e)
+	if #Q.items >= CONFIG.MaxQueue then
+		sendChat("The queue is full (" .. CONFIG.MaxQueue .. " audios).")
+		return false
+	end
+	if not e.album and e.who ~= LocalPlayer then
+		local mine = 0
+		for _, x in ipairs(Q.items) do
+			if x.who == e.who and not x.album then mine = mine + 1 end
+		end
+		if mine >= CONFIG.MaxPerPlayer then
+			sendChat(dn(e.who) .. ", you already have " .. mine .. " audios in the queue. Wait for some to play or use /queue remove.")
+			return false
+		end
+	end
+	Q.endNote = nil
+	Q.items[#Q.items + 1] = e
+	if not Q.running then
+		Q.running = true
+		local gen = playGen
+		task.spawn(function() Q.loop(gen) end)
+	elseif not e.album then
+		local c = e.cands[1]
+		local by = (e.who and e.who ~= LocalPlayer) and (" - requested by " .. dn(e.who)) or ""
+		sendChat("Queued #" .. #Q.items .. ": " .. label(c) .. K.tag(c) .. by)
+	end
+	return true
+end
+
+function Q.stop()
+	local had = Q.running or #Q.items > 0
+	playGen = playGen + 1
+	Q.items = {}
+	Q.cur = nil
+	Q.running = false
+	Q.skip = false
+	Q.endNote = nil
+	stopBoombox()
+	if had then sendChat("Stopped. The queue is cleared.") end
+end
+
+function Q.dropAlbum(al)
+	for i = #Q.items, 1, -1 do
+		if Q.items[i].album == al then table.remove(Q.items, i) end
+	end
+	if Q.cur and Q.cur.album == al then
+		Q.skip = true
+		Q.endNote = false
+	end
+end
+
+function Q.line(i, e)
+	local c = e.cands[1]
+	local nm = (c.name ~= "" and c.name or ("audio " .. c.id)):sub(1, 28)
+	local au = c.author ~= "" and (" - " .. c.author:sub(1, 14)) or ""
+	return i .. ". " .. nm .. au .. K.tag(c) .. " (" .. dn(e.who):sub(1, 10) .. ")"
+end
+
+function Q.show()
+	local n = #Q.items
+	local cur = Q.cur
+	local head = cur and ("Now: " .. label(cur.now or cur.cands[1]) .. ". ") or ""
+	if n == 0 then
+		sendChat(head .. "The queue is empty.")
+		return
+	end
+	local entries = {}
+	for i = 1, math.min(n, 8) do entries[i] = Q.line(i, Q.items[i]) end
+	if n > 8 then entries[#entries + 1] = "+" .. (n - 8) .. " more" end
+	sendList(head .. "Queue (" .. n .. "):", entries, " | ")
+end
+
+function Q.clear(who)
+	local removed = 0
+	for i = #Q.items, 1, -1 do
+		if who == LocalPlayer or Q.items[i].who == who then
+			table.remove(Q.items, i)
+			removed = removed + 1
+		end
+	end
+	if removed == 0 then
+		sendChat("There was nothing of yours in the queue.")
+	else
+		sendChat("Removed " .. removed .. " audio" .. (removed == 1 and "" or "s") .. " from the queue.")
+	end
+end
+
+function Q.remove(arg, who)
+	if #Q.items == 0 then
+		sendChat("The queue is empty.")
+		return
+	end
+	arg = trim((arg:gsub("^#", "")))
+	if arg == "" then
+		hint(who, "/queue remove <number|title|last>   (the numbers are in /queue)")
+		return
+	end
+	local low = arg:lower()
+	if low == "all" then
+		Q.clear(who)
+		return
+	end
+	local idx = nil
+	if low == "last" then
+		for i = #Q.items, 1, -1 do
+			if who == LocalPlayer or Q.items[i].who == who then
+				idx = i
+				break
+			end
+		end
+		if not idx then
+			sendChat("You have nothing in the queue to remove.")
+			return
+		end
+	elseif arg:match("^%d+$") then
+		idx = tonumber(arg)
+		if not Q.items[idx] then
+			sendChat("There's no #" .. idx .. " in the queue - it has " .. #Q.items .. ".")
+			return
+		end
+	else
+		local qw = wordsOf(arg)
+		for i, e in ipairs(Q.items) do
+			local c = e.cands[1]
+			local _, nset = wordsOf(c.name .. " " .. c.author)
+			local all = #qw > 0
+			for _, w in ipairs(qw) do
+				if not nset[w] then
+					all = false
+					break
+				end
+			end
+			if all then
+				idx = i
+				break
+			end
+		end
+		if not idx then
+			sendChat("I can't find that in the queue.")
+			return
+		end
+	end
+	local e = Q.items[idx]
+	if e.who ~= who and who ~= LocalPlayer then
+		sendChat("Only " .. dn(e.who) .. " (who queued it) or the boombox owner can remove that.")
+		return
+	end
+	table.remove(Q.items, idx)
+	sendChat("Removed #" .. idx .. " from the queue: " .. label(e.cands[1]) .. ".")
+end
+
+function Q.cmdQueue(rest, who)
+	who = who or LocalPlayer
+	rest = trim(rest)
+	local sub, arg = rest:match("^(%a*)%s*(.-)$")
+	sub = (sub or ""):lower()
+	arg = trim(arg or "")
+	if (sub == "" and arg == "") or sub == "list" or sub == "show" then
+		Q.show()
+	elseif sub == "remove" or sub == "rm" or sub == "delete" or sub == "del" then
+		Q.remove(arg, who)
+	elseif sub == "clear" then
+		Q.clear(who)
+	else
+		hint(who, "/queue   |   /queue remove <number|title|last>   |   /queue clear")
+	end
+end
+
+function Q.cmdSkip(rest, who)
+	local e = Q.cur
+	if not e then
+		sendChat("Nothing is playing right now.")
+		return
+	end
+	local c = e.now or e.cands[1]
+	local nxt = Q.items[1]
+	Q.skip = true
+	if nxt then
+		Q.endNote = nil
+		sendChat("Skipping " .. label(c) .. ". Next: " .. label(nxt.cands[1]) .. ".")
+	else
+		Q.endNote = "Skipped. The queue is empty, so I stopped the boombox."
+		sendChat("Skipping " .. label(c) .. ".")
+	end
 end
 
 local function albumLoad(who, arg)
@@ -1832,61 +2827,50 @@ local function albumLoad(who, arg)
 		sendChat("The album " .. al.name .. " is empty. Add audio with /album add <audio> " .. al.name .. ".")
 		return
 	end
-	playGen = playGen + 1
-	local gen = playGen
-	local tool = findBoombox()
-	if not tool then
+	if not findBoombox() then
 		sendChat("I need boombox.")
 		return
 	end
-	local list = {}
-	for i, tk in ipairs(al.tracks) do list[i] = { id = tk.id, name = tk.name, author = tk.author } end
-	local st = { who = who, album = al, skip = false, gen = gen }
-	PL = st
-	sendChat("Loading " .. dn(who) .. "'s album " .. al.name .. " (" .. #list .. " audio" .. (#list == 1 and "" or "s") .. ").")
-	local played, failed = 0, 0
-	for i, c in ipairs(list) do
-		if gen ~= playGen or gone then return end
-		st.skip = false
-		local ok = playFirstThatWorks(tool, { c }, gen, goodForm ~= nil)
-		if gen ~= playGen or gone then return end
-		if ok then
-			played = played + 1
-			NOW = c
-			sendChat("Now playing (" .. i .. "/" .. #list .. "): " .. label(c) .. " (" .. c.id .. ") - " .. dn(who) .. "'s album " .. al.name)
-			local more = waitTrackEnd(tool, c, gen, st)
-			if gen ~= playGen or gone then return end
-			if not more then
-				if PL == st then PL = nil end
-				sendChat("Album " .. al.name .. " stopped (the boombox was put away).")
-				return
-			end
-		else
-			failed = failed + 1
-			sendChat("Skipping " .. label(c) .. " - it couldn't play (removed/banned?).")
-		end
+	local n = #al.tracks
+	if #Q.items + n > CONFIG.MaxQueue then
+		sendChat("The queue is too full for that album (" .. #Q.items .. "/" .. CONFIG.MaxQueue .. ").")
+		return
 	end
-	if PL == st then PL = nil end
-	sendChat("Album " .. al.name .. " finished (" .. played .. " played" .. (failed > 0 and (", " .. failed .. " skipped") or "") .. ").")
+	local run = { played = 0, failed = 0 }
+	local busy = Q.running
+	sendChat((busy and "Queued " or "Loading ") .. dn(who) .. "'s album " .. al.name .. " (" .. n .. " audio" .. (n == 1 and "" or "s") .. ")" .. (busy and " after what's already queued." or "."))
+	for i, tk in ipairs(al.tracks) do
+		Q.add({ cands = { { id = tk.id, name = tk.name, author = tk.author } }, who = who, album = al, i = i, n = n, run = run })
+	end
 end
 
 local function albumControl(who, what)
-	if not PL or PL.gen ~= playGen then
-		PL = nil
+	local has = (Q.cur and Q.cur.album) and Q.cur or nil
+	if not has then
+		for _, e in ipairs(Q.items) do
+			if e.album then
+				has = e
+				break
+			end
+		end
+	end
+	if not has then
 		sendChat("No album is playing right now.")
 		return
 	end
-	if who ~= PL.who and who ~= LocalPlayer then
-		sendChat("Only " .. dn(PL.who) .. " (who loaded the album) or the boombox owner can do that.")
+	if who ~= has.who and who ~= LocalPlayer then
+		sendChat("Only " .. dn(has.who) .. " (who loaded the album) or the boombox owner can do that.")
 		return
 	end
 	if what == "skip" then
-		PL.skip = true
-		sendChat("Skipping to the next audio.")
+		if Q.cur and Q.cur.album then
+			Q.skip = true
+			sendChat("Skipping to the next audio.")
+		else
+			sendChat("The album is waiting in the queue - it hasn't started yet.")
+		end
 	else
-		playGen = playGen + 1
-		PL = nil
-		stopBoombox()
+		Q.dropAlbum(has.album)
 		sendChat("Album stopped.")
 	end
 end
@@ -2091,34 +3075,147 @@ do
 		return true
 	end
 
-	local function paint(btn, label, on)
-		btn.Text = label .. "\n" .. (on and "ON" or "OFF")
+	local cmdBtn, panel
+	local CMD_ROWS = {
+		"/play <title> [author] [sfx|long|song]",
+		"/play random [genre] [sfx|long|song]",
+		"/play <audio id>",
+		"/play pick <number>",
+		"/play stop",
+		"/skip",
+		"/queue",
+		"/queue remove <number|title|last>",
+		"/queue clear",
+		"/audio search <words> [page 1-1000]",
+		"/audio next",
+		"/audio prev",
+		"/audio id <number>",
+		"/audio grab id <title> [author]",
+		"/audio help [command]",
+		"/cmds",
+		"/volume <0-10>",
+		"/album create <name>",
+		"/album load <name>",
+		"/album add <audio> <album>",
+		"/album delete <name>",
+		"/album audio remove <audio> <album>",
+		"/album list [name]",
+		"/album skip",
+		"/album stop",
+		"/search <words>",
+		"/search platform [name]",
+		"/search platform add <name> <url>",
+		"/search platform remove <name>",
+		"/whitelist <player>",
+		"/blacklist <player>",
+		"/audio access everyone|friends|me",
+		"/audio strict on|off",
+	}
+
+	local function corner(obj, r)
+		pcall(function()
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, r)
+			c.Parent = obj
+		end)
+	end
+
+	local function copyText(text)
+		local f = setclipboard or toclipboard or writeclipboard
+		if not f then
+			note("Your executor has no clipboard function, so I can't copy that.")
+			return false
+		end
+		return pcall(f, text)
+	end
+
+	local function flash(b, text)
+		local old = b.Text
+		b.Text = text
+		task.spawn(function()
+			task.wait(0.8)
+			if b.Parent then b.Text = old end
+		end)
+	end
+
+	local function paint(btn, name, on)
+		btn.Text = name .. "\n" .. (on and "ON" or "OFF")
 		btn.BackgroundColor3 = on and Color3.fromRGB(46, 160, 90) or Color3.fromRGB(32, 34, 40)
 	end
 
 	refresh = function()
 		if flyBtn then paint(flyBtn, "FLY", FLY.on) end
-		if hideBtn then paint(hideBtn, "HIDE GUI", HIDE.on) end
+		if hideBtn then paint(hideBtn, "HIDE", HIDE.on) end
+		if cmdBtn then paint(cmdBtn, "CMDS", panel ~= nil and panel.Visible == true) end
 	end
 
-	local function makeButton(parent, name, x)
+	local function makeButton(parent, name, x, y, w, h)
 		local b = Instance.new("TextButton")
 		b.Name = name
-		b.Size = UDim2.new(0, 74, 0, 50)
-		b.Position = UDim2.new(0, x, 0, 0)
+		b.Size = UDim2.new(0, w, 0, h)
+		b.Position = UDim2.new(0, x, 0, y)
 		b.BorderSizePixel = 0
 		b.AutoButtonColor = true
 		b.TextColor3 = Color3.fromRGB(255, 255, 255)
-		b.TextSize = 13
+		b.TextSize = 10
 		b.TextWrapped = true
 		pcall(function() b.Font = Enum.Font.GothamBold end)
-		pcall(function()
-			local c = Instance.new("UICorner")
-			c.CornerRadius = UDim.new(0, 10)
-			c.Parent = b
-		end)
+		corner(b, 6)
 		b.Parent = parent
 		return b
+	end
+
+	local function buildPanel(parent)
+		panel = Instance.new("Frame")
+		panel.Name = "CommandsPanel"
+		panel.AnchorPoint = Vector2.new(1, 0)
+		panel.Position = UDim2.new(1, -8, 0.5, 22)
+		panel.Size = UDim2.new(0, 240, 0, 220)
+		panel.BackgroundColor3 = Color3.fromRGB(22, 24, 29)
+		panel.BorderSizePixel = 0
+		panel.Visible = false
+		corner(panel, 8)
+		panel.Parent = parent
+		local head = Instance.new("TextLabel")
+		head.Name = "Title"
+		head.BackgroundTransparency = 1
+		head.Position = UDim2.new(0, 8, 0, 4)
+		head.Size = UDim2.new(0, 150, 0, 18)
+		head.TextXAlignment = Enum.TextXAlignment.Left
+		head.TextColor3 = Color3.fromRGB(220, 224, 232)
+		head.TextSize = 11
+		pcall(function() head.Font = Enum.Font.GothamBold end)
+		head.Text = "Commands - tap to copy"
+		head.Parent = panel
+		local all = makeButton(panel, "CopyAllButton", 162, 4, 70, 18)
+		all.BackgroundColor3 = Color3.fromRGB(52, 90, 160)
+		all.Text = "COPY ALL"
+		all.Activated:Connect(function()
+			flash(all, copyText(table.concat(CMD_ROWS, "\n")) and "Copied!" or "Can't copy")
+		end)
+		local list = Instance.new("ScrollingFrame")
+		list.Name = "List"
+		list.BackgroundTransparency = 1
+		list.BorderSizePixel = 0
+		list.Position = UDim2.new(0, 4, 0, 26)
+		list.Size = UDim2.new(1, -8, 1, -30)
+		list.ScrollBarThickness = 3
+		list.Parent = panel
+		local y = 0
+		for i, text in ipairs(CMD_ROWS) do
+			local lines = math.max(1, math.ceil(#text / 36))
+			local h = lines * 12 + 8
+			local b = makeButton(list, "Cmd" .. i, 0, y, 220, h)
+			b.Size = UDim2.new(1, -6, 0, h)
+			b.BackgroundColor3 = Color3.fromRGB(34, 37, 45)
+			b.TextXAlignment = Enum.TextXAlignment.Left
+			b.Text = text
+			b.Activated:Connect(function()
+				flash(b, copyText(text) and "Copied!" or "Can't copy")
+			end)
+			y = y + h + 3
+		end
+		list.CanvasSize = UDim2.new(0, 0, 0, y)
 	end
 
 	pcall(function()
@@ -2130,13 +3227,19 @@ do
 		holder.Name = "Holder"
 		holder.BackgroundTransparency = 1
 		holder.AnchorPoint = Vector2.new(1, 0.5)
-		holder.Position = UDim2.new(1, -10, 0.5, 0)
-		holder.Size = UDim2.new(0, 156, 0, 50)
+		holder.Position = UDim2.new(1, -8, 0.5, 0)
+		holder.Size = UDim2.new(0, 134, 0, 30)
 		holder.Parent = gui
-		flyBtn = makeButton(holder, "FlyButton", 0)
-		hideBtn = makeButton(holder, "HideGuiButton", 82)
+		flyBtn = makeButton(holder, "FlyButton", 0, 0, 42, 30)
+		hideBtn = makeButton(holder, "HideGuiButton", 46, 0, 42, 30)
+		cmdBtn = makeButton(holder, "CmdsButton", 92, 0, 42, 30)
+		buildPanel(gui)
 		flyBtn.Activated:Connect(function() setFly(not FLY.on) end)
 		hideBtn.Activated:Connect(function() setHide(not HIDE.on) end)
+		cmdBtn.Activated:Connect(function()
+			panel.Visible = not panel.Visible
+			refresh()
+		end)
 		local hosts = {}
 		pcall(function()
 			if gethui then hosts[#hosts + 1] = gethui() end
@@ -2298,6 +3401,9 @@ local HANDLERS = {
 	audio = doAudio,
 	cmds = showCmds,
 	album = doAlbum,
+	skip = Q.cmdSkip,
+	queue = Q.cmdQueue,
+	search = PLAT.cmd,
 	volume = doVolume,
 	whitelist = function(r, w) setAccessFor("white", r, w) end,
 	blacklist = function(r, w) setAccessFor("black", r, w) end,
@@ -2357,7 +3463,7 @@ pcall(function()
 	if TextChatService.ChatVersion ~= Enum.ChatVersion.TextChatService then return end
 	local folder = TextChatService:FindFirstChild("TextChatCommands") or TextChatService:WaitForChild("TextChatCommands", 5)
 	if not folder then return end
-	for _, alias in ipairs({ "/play", "/audio", "/album", "/volume", "/cmds", "/whitelist", "/blacklist" }) do
+	for _, alias in ipairs({ "/play", "/audio", "/album", "/volume", "/cmds", "/whitelist", "/blacklist", "/skip", "/queue", "/search" }) do
 		local cmd = Instance.new("TextChatCommand")
 		cmd.Name = "BoomboxCmd_" .. alias:sub(2)
 		cmd.PrimaryAlias = alias
@@ -2391,5 +3497,5 @@ env.__BoomboxCleanup = function()
 	env.__BoomboxCleanup = nil
 end
 
-banner((registered and "Boombox commands ready: /play, /audio, /album and /volume (type /cmds for the list)" or "Boombox commands ready (old chat mode): /play, /audio, /album and /volume (type /cmds for the list)")
+banner((registered and "Boombox commands ready: /play, /skip, /queue, /audio, /album and /volume (type /cmds for the list)" or "Boombox commands ready (old chat mode): /play, /skip, /queue, /audio, /album and /volume (type /cmds for the list)")
 	.. ". Who can use them: " .. CONFIG.Access, 40, 120, 60, 8)
